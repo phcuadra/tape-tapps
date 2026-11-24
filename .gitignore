@@ -1,0 +1,9 @@
+# Ignore local intermediate build outputs inside subprojects while keeping prebuilt apps/*.tapp
+disintegrate/*.tapp
+sitting_in_a_room/*.tapp
+gonna_rain/*.tapp
+swinging_piano/*.tapp
+pendulum_music/*.tapp
+*.o
+*.d
+.DS_Store
