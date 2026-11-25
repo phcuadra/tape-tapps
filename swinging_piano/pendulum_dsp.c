@@ -18,10 +18,9 @@ static inline float clampf(float v, float lo, float hi) {
 #define SWING_DEG_TO_RAD    0.01745329251994329577f
 #define SWING_RAD_TO_DEG    57.2957795130823208768f
 #define SWING_MAX_ARC_DEG   55.0f
-#define SWING_LIMIT_RAD     1.08210414f             /* 62 deg safety ceiling */
+#define SWING_LIMIT_RAD     1.08210414f             /* 62 deg safety ceiling (< pi/2) */
 #define SWING_COAST_DAMP    0.075f                  /* natural free-pendulum air/pivot damping */
-#define SWING_DENORM_FLOOR  1.0e-18f
-#define SWING_PHYS_SUB      8u                      /* update Verlet ODE every 8 frames (6 kHz) */
+#define SWING_PHYS_SUB      32u                     /* 1.5 kHz Velocity-Verlet rate at 48 kHz */
 
 typedef struct {
     const char* name;
@@ -82,65 +81,125 @@ static const swing_rig_cfg_t kRigs[SWING_RIG_COUNT] = {
     },
 };
 
-static inline float flush_denorm(float x) {
-    return (fabsf(x) < SWING_DENORM_FLOOR) ? 0.0f : x;
+/*
+ * Branchless minimax sin/cos on [-pi/2, +pi/2] (zero external libm calls!).
+ * Pendulum angles are strictly bounded to +-1.082 rad (+-62 deg < 1.5708 rad).
+ */
+static inline float sin_halfpi(float r) {
+    const float r2 = r * r;
+    return r * (1.0f - r2 * (0.16666657f - r2 * (0.00833216f - r2 * 0.00019515f)));
+}
+
+static inline float cos_halfpi(float r) {
+    const float r2 = r * r;
+    return 1.0f - r2 * (0.5f - r2 * (0.04166646f - r2 * 0.00138873f));
+}
+
+static inline float fast_sin_u32(uint32_t ph) {
+    const int32_t sp = (int32_t)ph;
+    const float x = (float)sp * (1.0f / 2147483648.0f);
+    const float y = 4.0f * x * (1.0f - fabsf(x));
+    return y * (0.775f + 0.225f * fabsf(y));
 }
 
 float pendulum_clip_guard(float x) {
-    if (!(x > -4.0f && x < 4.0f)) return 0.0f;
     return clampf(x, -1.25f, 1.25f);
 }
 
-/*
- * Odd-symmetric C1 Pade rational tanh soft limiter with exact ceiling +-0.98f.
- * At |s| = 3.0f, s*(27 + s^2)/(27 + 9*s^2) == +-1.0f and d/ds == 0.0f.
- */
+/* Zero-division odd-symmetric C1 cubic soft limiter with exact ceiling +-0.98f */
 float pendulum_soft_limit(float x) {
-    if (!(x > -8.0f && x < 8.0f)) {
-        return (x >= 0.0f) ? 0.98f : -0.98f;
-    }
-    const float ceiling = 0.98f;
-    const float s = x * (1.0f / 0.98f);
-    if (s >= 3.0f) return ceiling;
-    if (s <= -3.0f) return -ceiling;
-    const float s2 = s * s;
-    return ceiling * (s * (27.0f + s2)) / (27.0f + 9.0f * s2);
+    const float c = clampf(x, -1.47f, 1.47f);
+    return c * (1.0f - 0.15429503f * c * c);
 }
 
 /*
- * 4-point, 3rd-order Catmull-Rom / Hermite cubic fractional delay reader.
- * Assumes `wr` is the index most recently written; `delay_samp` in [2.0f .. mask - 4.0f].
+ * Unclamped 4-point Hermite cubic fractional delay reader on interleaved `src_ring`.
+ * `delay_samp` is guaranteed in [4.0f, SWING_SRC_LEN - 16] by control-rate bounds.
  */
-static inline float hermite_read_ring(const float* buf, uint32_t wr, uint32_t mask, float delay_samp) {
-    const float d = clampf(delay_samp, 2.0f, (float)(mask - 4u));
-    const int32_t di = (int32_t)floorf(d);
-    const float f = d - (float)di;
+static inline float hermite_read_src_l(const swing_frame_t* restrict ring, uint32_t wr, float delay_samp) {
+    const int32_t di = (int32_t)delay_samp;
+    const float f = delay_samp - (float)di;
+    const uint32_t base = wr - (uint32_t)di;
 
-    const uint32_t i_m1 = (wr - (uint32_t)di + 1u) & mask;
-    const uint32_t i_0  = (wr - (uint32_t)di)      & mask;
-    const uint32_t i_1  = (wr - (uint32_t)di - 1u) & mask;
-    const uint32_t i_2  = (wr - (uint32_t)di - 2u) & mask;
+    const float ym1 = ring[(base + 1u) & SWING_SRC_MASK].l;
+    const float y0  = ring[base        & SWING_SRC_MASK].l;
+    const float y1  = ring[(base - 1u) & SWING_SRC_MASK].l;
+    const float y2  = ring[(base - 2u) & SWING_SRC_MASK].l;
 
-    const float ym1 = buf[i_m1];
-    const float y0  = buf[i_0];
-    const float y1  = buf[i_1];
-    const float y2  = buf[i_2];
-
-    const float c0 = y0;
     const float c1 = 0.5f * (y1 - ym1);
     const float c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
     const float c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);
-
-    return ((c3 * f + c2) * f + c1) * f + c0;
+    return ((c3 * f + c2) * f + c1) * f + y0;
 }
 
-static inline float linear_read_ring(const float* buf, uint32_t wr, uint32_t mask, float delay_samp) {
-    const float d = clampf(delay_samp, 1.0f, (float)(mask - 2u));
-    const int32_t di = (int32_t)floorf(d);
-    const float f = d - (float)di;
-    const float y0 = buf[(wr - (uint32_t)di) & mask];
-    const float y1 = buf[(wr - (uint32_t)di - 1u) & mask];
+static inline float hermite_read_src_r(const swing_frame_t* restrict ring, uint32_t wr, float delay_samp) {
+    const int32_t di = (int32_t)delay_samp;
+    const float f = delay_samp - (float)di;
+    const uint32_t base = wr - (uint32_t)di;
+
+    const float ym1 = ring[(base + 1u) & SWING_SRC_MASK].r;
+    const float y0  = ring[base        & SWING_SRC_MASK].r;
+    const float y1  = ring[(base - 1u) & SWING_SRC_MASK].r;
+    const float y2  = ring[(base - 2u) & SWING_SRC_MASK].r;
+
+    const float c1 = 0.5f * (y1 - ym1);
+    const float c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
+    const float c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);
+    return ((c3 * f + c2) * f + c1) * f + y0;
+}
+
+/* Fast 2-point linear fractional delay readers for diffuse wall reflections & FDN */
+static inline float linear_read_src_l(const swing_frame_t* restrict ring, uint32_t wr, float delay_samp) {
+    const int32_t di = (int32_t)delay_samp;
+    const float f = delay_samp - (float)di;
+    const uint32_t base = wr - (uint32_t)di;
+    const float y0 = ring[base        & SWING_SRC_MASK].l;
+    const float y1 = ring[(base - 1u) & SWING_SRC_MASK].l;
     return y0 + f * (y1 - y0);
+}
+
+static inline float linear_read_src_r(const swing_frame_t* restrict ring, uint32_t wr, float delay_samp) {
+    const int32_t di = (int32_t)delay_samp;
+    const float f = delay_samp - (float)di;
+    const uint32_t base = wr - (uint32_t)di;
+    const float y0 = ring[base        & SWING_SRC_MASK].r;
+    const float y1 = ring[(base - 1u) & SWING_SRC_MASK].r;
+    return y0 + f * (y1 - y0);
+}
+
+static inline float linear_read_ring(const float* restrict buf, uint32_t wr, uint32_t mask, float delay_samp) {
+    const int32_t di = (int32_t)delay_samp;
+    const float f = delay_samp - (float)di;
+    const uint32_t base = wr - (uint32_t)di;
+    const float y0 = buf[base        & mask];
+    const float y1 = buf[(base - 1u) & mask];
+    return y0 + f * (y1 - y0);
+}
+
+static inline swing_frame_t loop_read_hermite_fast(const swing_frame_t* restrict buf,
+                                                   int32_t len, int32_t idx, float f) {
+    int32_t im1 = idx - 1; if (im1 < 0) im1 += len;
+    int32_t ip1 = idx + 1; if (ip1 >= len) ip1 -= len;
+    int32_t ip2 = idx + 2; if (ip2 >= len) ip2 -= len;
+
+    const swing_frame_t s_m1 = buf[im1];
+    const swing_frame_t s_0  = buf[idx];
+    const swing_frame_t s_1  = buf[ip1];
+    const swing_frame_t s_2  = buf[ip2];
+
+    const float c1l = 0.5f * (s_1.l - s_m1.l);
+    const float c2l = s_m1.l - 2.5f * s_0.l + 2.0f * s_1.l - 0.5f * s_2.l;
+    const float c3l = 0.5f * (s_2.l - s_m1.l) + 1.5f * (s_0.l - s_1.l);
+
+    const float c1r = 0.5f * (s_1.r - s_m1.r);
+    const float c2r = s_m1.r - 2.5f * s_0.r + 2.0f * s_1.r - 0.5f * s_2.r;
+    const float c3r = 0.5f * (s_2.r - s_m1.r) + 1.5f * (s_0.r - s_1.r);
+
+    swing_frame_t res = {
+        ((c3l * f + c2l) * f + c1l) * f + s_0.l,
+        ((c3r * f + c2r) * f + c1r) * f + s_0.r,
+    };
+    return res;
 }
 
 const char* pendulum_rig_name(uint8_t rig_mode) {
@@ -159,33 +218,32 @@ static void update_hall_coeffs(pendulum_engine_t* d) {
     d->er_gain = h * (0.28f - 0.06f * h);
     d->hall_wet = h * (0.42f + 0.16f * h);
 
-    const float hc = sqrtf(h);
+    const float hc = sqrtf(h + 1.0e-12f);
     float fb = 0.36f + 0.53f * hc;
     if (d->rig_mode == SWING_RIG_CHAPEL) fb += 0.02f;
     if (d->rig_mode == SWING_RIG_CLOSE)  fb -= 0.05f;
     d->fdn_fb = clampf(fb, 0.25f, 0.91f);
 
-    /* Warm felt-hall HF damping (~3.4 kHz at 48 kHz) */
     const float fc = 4200.0f - 1200.0f * h;
     d->fdn_damp = clampf(SWING_TWO_PI * fc * d->inv_fs, 0.12f, 0.65f);
 }
 
 /*
  * Recompute 3D soundboard Cartesian coordinates (x_p, y_p, z_p), Euclidean
- * distances to Mic L, Mic R, and opposite lateral walls, plus inverse-distance
- * proximity swell, ORTF directional weighting, and off-axis air-absorption LP.
+ * distances to Mic L, Mic R, and opposite lateral walls (zero external libm calls!).
  */
 static void update_acoustic_targets(pendulum_engine_t* d, bool snap_immediate) {
     const swing_rig_cfg_t* rig = &kRigs[d->rig_mode % SWING_RIG_COUNT];
     const float L = d->rope_len;
     const float L_y = L * rig->ly_ratio;
 
-    const float sin_tx = sinf(d->theta_x);
-    const float cos_tx = cosf(d->theta_x);
-    const float sin_ty = sinf(d->theta_y);
-    const float cos_ty = cosf(d->theta_y);
+    const float tx = clampf(d->theta_x, -SWING_LIMIT_RAD, SWING_LIMIT_RAD);
+    const float ty = clampf(d->theta_y, -0.75f, 0.75f);
+    const float sin_tx = sin_halfpi(tx);
+    const float cos_tx = cos_halfpi(tx);
+    const float sin_ty = sin_halfpi(ty);
+    const float cos_ty = cos_halfpi(ty);
 
-    /* 3D Cartesian soundboard center (nadir = (0, 0, 0), +z upward toward fly-tower) */
     const float xp = L * sin_tx;
     const float yp = L_y * sin_ty;
     const float zp = L * (1.0f - cos_tx) + 0.5f * L_y * (1.0f - cos_ty);
@@ -193,13 +251,12 @@ static void update_acoustic_targets(pendulum_engine_t* d, bool snap_immediate) {
     d->x_p = xp;
     d->y_p = yp;
     d->z_p = zp;
-    d->live_deg_x = d->theta_x * SWING_RAD_TO_DEG;
-    d->live_deg_y = d->theta_y * SWING_RAD_TO_DEG;
+    d->live_deg_x = tx * SWING_RAD_TO_DEG;
+    d->live_deg_y = ty * SWING_RAD_TO_DEG;
 
-    /* Stationary stereo hall mic pair at (-d_mic/2, y_mic, z_mic) and (+d_mic/2, y_mic, z_mic) */
     const float half_m = 0.5f * rig->d_mic;
-    const float dx_l = xp - (-half_m);
-    const float dx_r = xp - (+half_m);
+    const float dx_l = xp + half_m;
+    const float dx_r = xp - half_m;
     const float dy   = yp - rig->y_mic;
     const float dz   = zp - rig->z_mic;
 
@@ -207,30 +264,19 @@ static void update_acoustic_targets(pendulum_engine_t* d, bool snap_immediate) {
     const float r_l = sqrtf(dx_l * dx_l + dyz_sq);
     const float r_r = sqrtf(dx_r * dx_r + dyz_sq);
 
-    /* Minimum reference distance at nadir (0, 0, 0) */
     const float r_nadir = sqrtf(half_m * half_m + rig->y_mic * rig->y_mic + rig->z_mic * rig->z_mic);
     const float r_floor = 0.75f * fabsf(rig->z_mic);
 
-    /*
-     * DOPPLER scaling:
-     *   0%   -> 0.00x (zero pitch shift; pure spatial panning/proximity)
-     *   50%  -> 1.00x (exact 343.0 m/s Barbican Hall physical propagation!)
-     *   100% -> 2.80x (dramatic close-mic Aphex swoop)
-     */
     const float dn = clampf(d->doppler_norm, 0.0f, 1.0f);
     const float doppler_scale = dn * (1.20f + 1.60f * dn);
     const float samp_per_m = d->sample_rate * (1.0f / SWING_SOUND_SPEED);
+    const float max_del = (float)(SWING_SRC_LEN - 16u);
 
     const float del_l = 12.0f + fmaxf(0.0f, r_l - r_floor) * samp_per_m * doppler_scale;
     const float del_r = 12.0f + fmaxf(0.0f, r_r - r_floor) * samp_per_m * doppler_scale;
-    d->del_dir_l_tgt = clampf(del_l, 4.0f, (float)(SWING_SRC_LEN - 16u));
-    d->del_dir_r_tgt = clampf(del_r, 4.0f, (float)(SWING_SRC_LEN - 16u));
+    d->del_dir_l_tgt = clampf(del_l, 4.0f, max_del);
+    d->del_dir_r_tgt = clampf(del_r, 4.0f, max_del);
 
-    /*
-     * Opposite-wall lateral Barbican image sources at x_img_L = -2*W - x_p and x_img_R = +2*W - x_p:
-     * When piano swings left (dx_p/dt < 0), r_wall_l shortens (pitching slightly UP) while
-     * r_wall_r lengthens (pitching slightly DOWN).
-     */
     const float two_w = 2.0f * rig->half_wall;
     const float dx_wl = two_w + xp - half_m;
     const float dx_wr = two_w - xp - half_m;
@@ -241,29 +287,23 @@ static void update_acoustic_targets(pendulum_engine_t* d, bool snap_immediate) {
     const float wall_dop = clampf(doppler_scale, 0.0f, 1.35f);
     const float del_wl = er_base + (r_wl - two_w) * samp_per_m * wall_dop;
     const float del_wr = er_base + (r_wr - two_w) * samp_per_m * wall_dop;
-    d->del_wall_l_tgt = clampf(del_wl, 200.0f, (float)(SWING_SRC_LEN - 16u));
-    d->del_wall_r_tgt = clampf(del_wr, 200.0f, (float)(SWING_SRC_LEN - 16u));
+    d->del_wall_l_tgt = clampf(del_wl, 120.0f, max_del);
+    d->del_wall_r_tgt = clampf(del_wr, 120.0f, max_del);
 
-    /* Inverse-distance proximity swell + outward ORTF cardioid stereo directivity */
     const float k_prox = 0.14f + 0.18f * dn;
     const float prox_norm = 1.14f;
     const float prox_l = prox_norm / (1.0f + k_prox * fmaxf(0.0f, r_l - r_nadir));
     const float prox_r = prox_norm / (1.0f + k_prox * fmaxf(0.0f, r_r - r_nadir));
 
     const float r_center = sqrtf(xp * xp + dyz_sq + 0.04f);
-    const float az = clampf(xp / r_center, -1.0f, 1.0f); /* -1 = far left, +1 = far right */
+    const float az = clampf(xp / r_center, -1.0f, 1.0f);
 
-    /* Normalized ORTF outward cardioid response (1.00 at center, ~3:1 L/R ratio at apexes) */
     const float card_l = clampf((0.52f + 0.48f * (-0.85f * az + 0.35f)) * 1.453f, 0.22f, 1.42f);
     const float card_r = clampf((0.52f + 0.48f * (+0.85f * az + 0.35f)) * 1.453f, 0.22f, 1.42f);
 
     d->gain_l_tgt = clampf(prox_l * card_l * 0.84f, 0.08f, 1.35f);
     d->gain_r_tgt = clampf(prox_r * card_r * 0.84f, 0.08f, 1.35f);
 
-    /*
-     * Dynamic soundboard radiation + air-absorption low-pass cutoff per ear:
-     * ~11.8 kHz directly overhead at nadir -> ~2.6 kHz when high & off-axis at opposite apex.
-     */
     const float dist_l = clampf((r_l - r_nadir) * 0.11f, 0.0f, 1.0f);
     const float dist_r = clampf((r_r - r_nadir) * 0.11f, 0.0f, 1.0f);
     const float shadow_l = clampf(0.5f * (az + 1.0f), 0.0f, 1.0f);
@@ -287,12 +327,12 @@ static void update_acoustic_targets(pendulum_engine_t* d, bool snap_immediate) {
 }
 
 /*
- * Advance 2D nonlinear gravitational pendulum by `dt` seconds via Velocity-Verlet.
+ * Advance 2D nonlinear gravitational pendulum by `dt` seconds via Velocity-Verlet
+ * (zero external libm calls!).
  */
 static void step_pendulum_verlet(pendulum_engine_t* d, float dt) {
     if (dt <= 0.0f || dt > 0.05f) return;
 
-    /* Smooth suspension cable length L so live ROPE tweaks never jerk velocity */
     d->rope_len += clampf(4.0f * dt, 0.0f, 1.0f) * (d->rope_len_target - d->rope_len);
     const float L = clampf(d->rope_len, 2.0f, 15.0f);
     const swing_rig_cfg_t* rig = &kRigs[d->rig_mode % SWING_RIG_COUNT];
@@ -302,67 +342,64 @@ static void step_pendulum_verlet(pendulum_engine_t* d, float dt) {
     const float g_Ly = SWING_GRAVITY / L_y;
     const float omega0 = sqrtf(g_L);
 
-    float tx = d->theta_x;
+    float tx = clampf(d->theta_x, -SWING_LIMIT_RAD, SWING_LIMIT_RAD);
     float ox = d->omega_x;
-    float ty = d->theta_y;
+    float ty = clampf(d->theta_y, -0.75f, 0.75f);
     float oy = d->omega_y;
+
+    const float sin_tx0 = sin_halfpi(tx);
+    const float sin_ty0 = sin_halfpi(ty);
 
     float drive_x = 0.0f;
     float drive_y = 0.0f;
     const float damp = SWING_COAST_DAMP;
 
     if (d->swing_on) {
-        const float th_max = d->theta_max;
+        const float th_max = clampf(d->theta_max, 0.0f, SWING_LIMIT_RAD);
         if (th_max > 0.003f) {
-            const float e_cur = 0.5f * ox * ox + g_L * (1.0f - cosf(tx));
-            const float e_tgt = g_L * (1.0f - cosf(th_max));
+            const float e_cur = 0.5f * ox * ox + g_L * (1.0f - cos_halfpi(tx));
+            const float e_tgt = g_L * (1.0f - cos_halfpi(th_max));
 
-            /* Gentle self-starting nudge if piano is completely still at nadir */
             if (e_cur < 1.0e-5f * g_L) {
                 ox += 0.28f * omega0 * th_max;
             }
 
-            /* Phase-coherent energy-regulating escapement: vanishes on target nonlinear orbit */
             const float k_esc = clampf(damp + 1.85f * (e_tgt - e_cur) / (e_tgt + 0.04f),
                                        -1.20f, 1.85f);
             drive_x = k_esc * ox;
 
-            /* Quadrature 2D elliptical depth coupling for theta_y */
-            const float ty_max = th_max * rig->y_sway_ratio;
-            const float oy_ref = -ty_max * omega0 * sinf(tx) / fmaxf(0.12f, sinf(th_max));
-            const float ey_cur = 0.5f * oy * oy + g_Ly * (1.0f - cosf(ty));
-            const float ey_tgt = g_Ly * (1.0f - cosf(ty_max));
+            const float ty_max = clampf(th_max * rig->y_sway_ratio, 0.0f, 0.75f);
+            const float oy_ref = -ty_max * omega0 * sin_tx0 / fmaxf(0.12f, sin_halfpi(th_max));
+            const float ey_cur = 0.5f * oy * oy + g_Ly * (1.0f - cos_halfpi(ty));
+            const float ey_tgt = g_Ly * (1.0f - cos_halfpi(ty_max));
             const float ky_esc = clampf(damp + 1.6f * (ey_tgt - ey_cur) / (ey_tgt + 0.02f),
                                         -1.2f, 1.6f);
             drive_y = ky_esc * oy + 0.35f * (oy_ref - oy);
         } else {
-            /* ARC == 0%: smooth active braking to stationary center */
             drive_x = -1.10f * ox;
             drive_y = -1.10f * oy;
         }
     }
 
-    /* 2nd-order Velocity-Verlet step on X pendulum */
-    const float ax0 = -g_L * sinf(tx) - damp * ox + drive_x;
+    const float ax0 = -g_L * sin_tx0 - damp * ox + drive_x;
     const float ox_half = ox + 0.5f * dt * ax0;
     float tx_next = clampf(tx + dt * ox_half, -SWING_LIMIT_RAD, SWING_LIMIT_RAD);
-    const float ax1 = -g_L * sinf(tx_next) - damp * ox_half + drive_x;
+    const float ax1 = -g_L * sin_halfpi(tx_next) - damp * ox_half + drive_x;
     float ox_next = ox_half + 0.5f * dt * ax1;
     if (fabsf(tx_next) >= SWING_LIMIT_RAD && (tx_next * ox_next) > 0.0f) {
         ox_next = 0.0f;
     }
 
-    /* 2nd-order Velocity-Verlet step on Y depth pendulum */
-    const float ay0 = -g_Ly * sinf(ty) - damp * oy + drive_y;
+    const float ay0 = -g_Ly * sin_ty0 - damp * oy + drive_y;
     const float oy_half = oy + 0.5f * dt * ay0;
     float ty_next = clampf(ty + dt * oy_half, -0.75f, 0.75f);
-    const float ay1 = -g_Ly * sinf(ty_next) - damp * oy_half + drive_y;
+    const float ay1 = -g_Ly * sin_halfpi(ty_next) - damp * oy_half + drive_y;
     float oy_next = oy_half + 0.5f * dt * ay1;
 
-    d->theta_x = flush_denorm(tx_next);
-    d->omega_x = flush_denorm(ox_next);
-    d->theta_y = flush_denorm(ty_next);
-    d->omega_y = flush_denorm(oy_next);
+    d->theta_x = tx_next;
+    d->omega_x = ox_next;
+    d->theta_y = ty_next;
+    d->omega_y = oy_next;
 
     update_acoustic_targets(d, false);
 }
@@ -374,8 +411,9 @@ void pendulum_init(pendulum_engine_t* d, float sample_rate) {
     d->sample_rate = (sample_rate > 8000.0f) ? sample_rate : 48000.0f;
     d->inv_fs = 1.0f / d->sample_rate;
 
-    /* 18 Hz 1-pole DC blocker pole */
     d->dc_r = clampf(1.0f - (SWING_TWO_PI * 18.0f * d->inv_fs), 0.990f, 0.9995f);
+    d->mod_inc_a = (uint32_t)(0.31f * d->inv_fs * 4294967296.0f + 0.5f);
+    d->mod_inc_b = (uint32_t)(0.47f * d->inv_fs * 4294967296.0f + 0.5f);
 
     d->rig_mode = SWING_RIG_BARBICAN;
     d->swing_on = true;
@@ -386,12 +424,12 @@ void pendulum_init(pendulum_engine_t* d, float sample_rate) {
     pendulum_set_doppler(d, 0.50f);
     pendulum_set_hall(d, 0.42f);
 
-    /* Start poised at left turning point so first playback swoops gracefully across hall */
     d->theta_x = -d->theta_max;
     d->omega_x = 0.0f;
     d->theta_y = 0.0f;
     d->omega_y = sqrtf(SWING_GRAVITY / d->rope_len) * d->theta_max *
                  kRigs[d->rig_mode].y_sway_ratio;
+    d->phys_rem = SWING_PHYS_SUB;
 
     update_acoustic_targets(d, true);
 }
@@ -423,13 +461,13 @@ void pendulum_clear_audio(pendulum_engine_t* d) {
     d->prox_env_l = 0.0f;
     d->prox_env_r = 0.0f;
     d->hall_env = 0.0f;
+    d->phys_rem = SWING_PHYS_SUB;
     update_acoustic_targets(d, true);
 }
 
 void pendulum_set_rope(pendulum_engine_t* d, float norm) {
     if (!d) return;
     d->rope_norm = clampf(norm, 0.0f, 1.0f);
-    /* 0% = 2.20m (~2.98s studio rig) -> 100% = 14.00m (~7.51s Barbican fly-tower) */
     d->rope_len_target = 2.20f + 11.80f * d->rope_norm;
     if (d->rope_len < 1.0f) d->rope_len = d->rope_len_target;
 }
@@ -466,7 +504,7 @@ void pendulum_set_swing_on(pendulum_engine_t* d, bool swing_on) {
     if (swing_on && was_off && d->theta_max > 0.02f) {
         const float e = pendulum_get_energy(d);
         const float g_L = SWING_GRAVITY / fmaxf(2.0f, d->rope_len);
-        if (e < 0.02f * g_L * (1.0f - cosf(d->theta_max))) {
+        if (e < 0.02f * g_L * (1.0f - cos_halfpi(d->theta_max))) {
             pendulum_push(d, 0.45f);
         }
     }
@@ -477,17 +515,17 @@ void pendulum_push(pendulum_engine_t* d, float impulse_norm) {
     const float imp = clampf(impulse_norm, 0.15f, 1.0f);
     const float L = fmaxf(2.0f, d->rope_len);
     const float omega0 = sqrtf(SWING_GRAVITY / L);
-    const float ref_ang = fmaxf(d->theta_max, 38.0f * SWING_DEG_TO_RAD);
-    const float v_kick = imp * omega0 * (1.15f * sinf(0.5f * ref_ang) * 2.0f);
+    const float ref_ang = clampf(fmaxf(d->theta_max, 38.0f * SWING_DEG_TO_RAD), 0.0f, SWING_LIMIT_RAD);
+    const float v_kick = imp * omega0 * (1.15f * sin_halfpi(0.5f * ref_ang) * 2.0f);
 
     const float dir = (fabsf(d->omega_x) > 0.01f)
                           ? ((d->omega_x >= 0.0f) ? 1.0f : -1.0f)
                           : ((d->theta_x <= 0.0f) ? 1.0f : -1.0f);
 
+    const float tx = clampf(d->theta_x, -SWING_LIMIT_RAD, SWING_LIMIT_RAD);
     float new_ox = d->omega_x + dir * v_kick;
-    /* Cap mechanical energy safely below 60 deg ceiling */
-    const float max_e = (SWING_GRAVITY / L) * (1.0f - cosf(58.0f * SWING_DEG_TO_RAD));
-    const float pot_e = (SWING_GRAVITY / L) * (1.0f - cosf(d->theta_x));
+    const float max_e = (SWING_GRAVITY / L) * (1.0f - cos_halfpi(58.0f * SWING_DEG_TO_RAD));
+    const float pot_e = (SWING_GRAVITY / L) * (1.0f - cos_halfpi(tx));
     if (pot_e < max_e) {
         const float max_ox = sqrtf(2.0f * (max_e - pot_e));
         new_ox = clampf(new_ox, -max_ox, max_ox);
@@ -508,209 +546,285 @@ void pendulum_center_still(pendulum_engine_t* d) {
     d->theta_y = 0.0f;
     d->omega_y = 0.0f;
     d->live_cents = 0.0f;
-    /* Keep snap_immediate = false so 2-pole delay smoothers glide smoothly to center! */
     update_acoustic_targets(d, false);
 }
 
 float pendulum_get_energy(const pendulum_engine_t* d) {
     if (!d) return 0.0f;
     const float L = fmaxf(2.0f, d->rope_len);
-    return 0.5f * d->omega_x * d->omega_x + (SWING_GRAVITY / L) * (1.0f - cosf(d->theta_x));
+    const float tx = clampf(d->theta_x, -SWING_LIMIT_RAD, SWING_LIMIT_RAD);
+    return 0.5f * d->omega_x * d->omega_x + (SWING_GRAVITY / L) * (1.0f - cos_halfpi(tx));
 }
 
 void pendulum_step_idle(pendulum_engine_t* d, float dt_sec) {
     if (!d) return;
     const float step = clampf(dt_sec, 0.0f, 0.05f);
-    /* Subdivide into 4 steps for crisp Verlet accuracy during idle UI preview */
-    const float sub_dt = 0.25f * step;
-    for (uint32_t i = 0u; i < 4u; ++i) {
-        step_pendulum_verlet(d, sub_dt);
-    }
+    const float sub_dt = 0.5f * step;
+    step_pendulum_verlet(d, sub_dt);
+    step_pendulum_verlet(d, sub_dt);
     d->live_cents *= 0.85f;
 }
 
-static inline float schroeder_allpass(float* buf, uint32_t wr, uint32_t mask,
+static inline float schroeder_allpass(float* restrict buf, uint32_t wr, uint32_t mask,
                                       uint32_t del, float g, float x) {
     const float delayed = buf[(wr - del) & mask];
-    const float v = flush_denorm(x + g * delayed);
+    const float v = x + g * delayed;
     buf[wr] = v;
     return delayed - g * v;
 }
 
-swing_frame_t pendulum_process_frame(pendulum_engine_t* d, swing_frame_t dry) {
-    const float in_l = pendulum_clip_guard(dry.l);
-    const float in_r = pendulum_clip_guard(dry.r);
+/*
+ * Fast block-fused 48 kHz swinging-piano + concert-hall FDN processor.
+ * Zero external libm calls, zero float divisions, zero denormal-branch stalls!
+ */
+void pendulum_process_block(pendulum_engine_t* restrict d,
+                            const swing_frame_t* restrict loop_buf,
+                            uint32_t loop_len,
+                            volatile int32_t* restrict io_head_i,
+                            volatile float* restrict io_head_f,
+                            float speed_target,
+                            float* restrict io_speed_cur,
+                            float play_target,
+                            float play_step,
+                            float* restrict io_play_gain,
+                            float* restrict out_bus,
+                            uint32_t frames) {
+    if (!d || !out_bus || frames == 0u) return;
 
-    /* Step nonlinear 2D pendulum ODE every 8 samples (6,000 Hz) */
-    if (d->phys_sub == 0u) {
-        step_pendulum_verlet(d, (float)SWING_PHYS_SUB * d->inv_fs);
+    if (!loop_buf || loop_len < 8u) {
+        memset(out_bus, 0, (size_t)frames * 2u * sizeof(float));
+        return;
     }
-    d->phys_sub = (uint8_t)((d->phys_sub + 1u) & (SWING_PHYS_SUB - 1u));
 
-    /*
-     * Cascaded 2-pole per-sample delay smoothing (a = 0.0020f -> tau ~10.4 ms):
-     * Guarantees C1-continuous delay & pitch across knob turns while preserving
-     * 99.95% of 0.13-0.35 Hz pendulum Doppler excursion.
-     */
-    const float ds_a = 0.0020f;
-    const float prev_del_l = d->del_dir_l;
-    const float prev_del_r = d->del_dir_r;
+    const int32_t size = (int32_t)loop_len;
+    int32_t head_i = *io_head_i;
+    if (head_i < 0 || head_i >= size) head_i = 0;
+    float head_f = *io_head_f;
+    float speed_cur = *io_speed_cur;
+    float pg = *io_play_gain;
 
-    d->del_dir_l_s1 += ds_a * (d->del_dir_l_tgt - d->del_dir_l_s1);
-    d->del_dir_l    += ds_a * (d->del_dir_l_s1  - d->del_dir_l);
-    d->del_dir_r_s1 += ds_a * (d->del_dir_r_tgt - d->del_dir_r_s1);
-    d->del_dir_r    += ds_a * (d->del_dir_r_s1  - d->del_dir_r);
+    swing_space_t* restrict sp = d->space;
+    uint32_t src_wr  = d->src_wr;
+    uint32_t ap_wr   = d->ap_wr;
+    uint32_t fdn0_wr = d->fdn0_wr;
+    uint32_t fdn_wr  = d->fdn_wr;
+    uint32_t mod_a   = d->mod_ph_a;
+    uint32_t mod_b   = d->mod_ph_b;
+    const uint32_t inc_a = d->mod_inc_a;
+    const uint32_t inc_b = d->mod_inc_b;
 
-    d->del_wall_l_s1 += ds_a * (d->del_wall_l_tgt - d->del_wall_l_s1);
-    d->del_wall_l    += ds_a * (d->del_wall_l_s1  - d->del_wall_l);
-    d->del_wall_r_s1 += ds_a * (d->del_wall_r_tgt - d->del_wall_r_s1);
-    d->del_wall_r    += ds_a * (d->del_wall_r_s1  - d->del_wall_r);
+    const float ds_a     = 0.0020f;
+    const float dc_r     = d->dc_r;
+    const float er_gain  = d->er_gain;
+    const float hall_wet = d->hall_wet;
+    const float fdn_fb   = d->fdn_fb;
+    const float fdn_damp = d->fdn_damp;
+    const float sc       = d->rig_size_scale;
+    const uint32_t tap0  = (uint32_t)(997.0f * sc);
+    const uint32_t tap1  = (uint32_t)(1493.0f * sc);
+    const float tap2_b   = 1789.0f * sc;
+    const float tap3_b   = 2017.0f * sc;
+    const bool do_er     = (sp != NULL) && (er_gain > 0.0005f);
+    const bool do_hall   = (sp != NULL) && (hall_wet > 0.0005f);
 
-    d->gain_l += 0.0025f * (d->gain_l_tgt - d->gain_l);
-    d->gain_r += 0.0025f * (d->gain_r_tgt - d->gain_r);
-    d->lp_a_l += 0.0025f * (d->lp_a_l_tgt - d->lp_a_l);
-    d->lp_a_r += 0.0025f * (d->lp_a_r_tgt - d->lp_a_r);
+    uint32_t rem = frames;
+    float* restrict dst = out_bus;
+    float d_del_last = 0.0f;
 
-    /* Instantaneous Doppler pitch-shift telemetry in cents (~1731.23 * (ratio - 1)) */
-    const float d_del_mean = 0.5f * ((d->del_dir_l - prev_del_l) + (d->del_dir_r - prev_del_r));
-    const float inst_cents = clampf(-d_del_mean * 1731.234f, -199.0f, 199.0f);
-    d->live_cents += 0.003f * (inst_cents - d->live_cents);
+    while (rem > 0u) {
+        if (d->phys_rem == 0u) {
+            step_pendulum_verlet(d, (float)SWING_PHYS_SUB * d->inv_fs);
+            d->phys_rem = SWING_PHYS_SUB;
+        }
+        const uint32_t chunk = (rem < d->phys_rem) ? rem : d->phys_rem;
+        d->phys_rem = (uint8_t)(d->phys_rem - chunk);
+        rem -= chunk;
 
-    /* Soundboard acoustic radiation: blend L/R slightly so point/soundboard source radiates coherently */
-    const float sb_l = 0.80f * in_l + 0.20f * in_r;
-    const float sb_r = 0.20f * in_l + 0.80f * in_r;
+        for (uint32_t n = 0u; n < chunk; ++n) {
+            speed_cur += 0.002f * (speed_target - speed_cur);
+            if (pg < play_target) {
+                pg += play_step;
+                if (pg > play_target) pg = play_target;
+            } else if (pg > play_target) {
+                pg -= play_step;
+                if (pg < play_target) pg = play_target;
+            }
 
-    float dir_l = sb_l;
-    float dir_r = sb_r;
-    float er_l  = 0.0f;
-    float er_r  = 0.0f;
+            swing_frame_t dry = { 0.0f, 0.0f };
+            if (pg > 0.0001f) {
+                dry = loop_read_hermite_fast(loop_buf, size, head_i, head_f);
+                dry.l *= pg;
+                dry.r *= pg;
 
-    swing_space_t* sp = d->space;
-    if (sp) {
-        const uint32_t wr = d->src_wr;
-        sp->src_l[wr] = sb_l;
-        sp->src_r[wr] = sb_r;
+                float nf = head_f + speed_cur;
+                const int32_t is = (int32_t)floorf(nf);
+                nf -= (float)is;
+                int32_t next_i = head_i + is;
+                if (next_i >= size) {
+                    next_i %= size;
+                } else if (next_i < 0) {
+                    next_i = size - 1 - ((-1 - next_i) % size);
+                }
+                head_i = next_i;
+                head_f = nf;
+            }
 
-        /* Direct Hermite-interpolated soundboard -> stationary hall mic pair */
-        dir_l = hermite_read_ring(sp->src_l, wr, SWING_SRC_MASK, d->del_dir_l);
-        dir_r = hermite_read_ring(sp->src_r, wr, SWING_SRC_MASK, d->del_dir_r);
+            const float prev_dl = d->del_dir_l;
+            const float prev_dr = d->del_dir_r;
 
-        /* Opposite-wall early reflections with counter-Doppler chorus */
-        if (d->er_gain > 0.0005f) {
-            const float wl_raw = hermite_read_ring(sp->src_l, wr, SWING_SRC_MASK, d->del_wall_l);
-            const float wr_raw = hermite_read_ring(sp->src_r, wr, SWING_SRC_MASK, d->del_wall_r);
+            d->del_dir_l_s1 += ds_a * (d->del_dir_l_tgt - d->del_dir_l_s1);
+            d->del_dir_l    += ds_a * (d->del_dir_l_s1  - d->del_dir_l);
+            d->del_dir_r_s1 += ds_a * (d->del_dir_r_tgt - d->del_dir_r_s1);
+            d->del_dir_r    += ds_a * (d->del_dir_r_s1  - d->del_dir_r);
 
-            d->wall_lp_l = flush_denorm(d->wall_lp_l + 0.34f * (wl_raw - d->wall_lp_l));
-            d->wall_lp_r = flush_denorm(d->wall_lp_r + 0.34f * (wr_raw - d->wall_lp_r));
+            d->del_wall_l_s1 += ds_a * (d->del_wall_l_tgt - d->del_wall_l_s1);
+            d->del_wall_l    += ds_a * (d->del_wall_l_s1  - d->del_wall_l);
+            d->del_wall_r_s1 += ds_a * (d->del_wall_r_tgt - d->del_wall_r_s1);
+            d->del_wall_r    += ds_a * (d->del_wall_r_s1  - d->del_wall_r);
 
-            er_l = d->er_gain * (0.82f * d->wall_lp_l + 0.28f * d->wall_lp_r);
-            er_r = d->er_gain * (0.82f * d->wall_lp_r + 0.28f * d->wall_lp_l);
+            d->gain_l += 0.0025f * (d->gain_l_tgt - d->gain_l);
+            d->gain_r += 0.0025f * (d->gain_r_tgt - d->gain_r);
+            d->lp_a_l += 0.0025f * (d->lp_a_l_tgt - d->lp_a_l);
+            d->lp_a_r += 0.0025f * (d->lp_a_r_tgt - d->lp_a_r);
+
+            d_del_last = 0.5f * ((d->del_dir_l - prev_dl) + (d->del_dir_r - prev_dr));
+
+            const float anti_dn = ((n & 1u) != 0u) ? 1.0e-20f : -1.0e-20f;
+            const float sb_l = 0.80f * dry.l + 0.20f * dry.r + anti_dn;
+            const float sb_r = 0.20f * dry.l + 0.80f * dry.r - anti_dn;
+
+            float dir_l = sb_l;
+            float dir_r = sb_r;
+            float er_l  = 0.0f;
+            float er_r  = 0.0f;
+
+            if (sp) {
+                sp->src_ring[src_wr].l = sb_l;
+                sp->src_ring[src_wr].r = sb_r;
+
+                dir_l = hermite_read_src_l(sp->src_ring, src_wr, d->del_dir_l);
+                dir_r = hermite_read_src_r(sp->src_ring, src_wr, d->del_dir_r);
+
+                if (do_er) {
+                    const float wl_raw = linear_read_src_l(sp->src_ring, src_wr, d->del_wall_l);
+                    const float wr_raw = linear_read_src_r(sp->src_ring, src_wr, d->del_wall_r);
+                    d->wall_lp_l += 0.34f * (wl_raw - d->wall_lp_l);
+                    d->wall_lp_r += 0.34f * (wr_raw - d->wall_lp_r);
+                    er_l = er_gain * (0.82f * d->wall_lp_l + 0.28f * d->wall_lp_r);
+                    er_r = er_gain * (0.82f * d->wall_lp_r + 0.28f * d->wall_lp_l);
+                }
+
+                src_wr = (src_wr + 1u) & SWING_SRC_MASK;
+            }
+
+            d->air_lp_l += d->lp_a_l * (dir_l - d->air_lp_l);
+            d->air_lp_r += d->lp_a_r * (dir_r - d->air_lp_r);
+
+            const float mic_l = d->air_lp_l * d->gain_l;
+            const float mic_r = d->air_lp_r * d->gain_r;
+
+            float rev_l = 0.0f;
+            float rev_r = 0.0f;
+            if (do_hall) {
+                const float diff_in_l = 0.45f * (mic_l + er_l);
+                const float diff_in_r = 0.45f * (mic_r + er_r);
+
+                const float diff_l = schroeder_allpass(sp->ap_l, ap_wr, SWING_AP_MASK, 173u, 0.58f, diff_in_l);
+                const float diff_r = schroeder_allpass(sp->ap_r, ap_wr, SWING_AP_MASK, 229u, 0.58f, diff_in_r);
+                ap_wr = (ap_wr + 1u) & SWING_AP_MASK;
+
+                mod_a += inc_a;
+                mod_b += inc_b;
+                const float lfo_a = 3.2f * fast_sin_u32(mod_a);
+                const float lfo_b = 3.2f * fast_sin_u32(mod_b);
+
+                const float r0 = sp->fdn0[(fdn0_wr - tap0) & SWING_FDN0_MASK];
+                const float r1 = sp->fdn1[(fdn_wr  - tap1) & SWING_FDN_MASK];
+                const float r2 = linear_read_ring(sp->fdn2, fdn_wr, SWING_FDN_MASK, tap2_b + lfo_a);
+                const float r3 = linear_read_ring(sp->fdn3, fdn_wr, SWING_FDN_MASK, tap3_b + lfo_b);
+
+                d->fdn_lp[0] += fdn_damp * (r0 - d->fdn_lp[0]);
+                d->fdn_lp[1] += fdn_damp * (r1 - d->fdn_lp[1]);
+                d->fdn_lp[2] += fdn_damp * (r2 - d->fdn_lp[2]);
+                d->fdn_lp[3] += fdn_damp * (r3 - d->fdn_lp[3]);
+
+                const float u0 = d->fdn_lp[0] * fdn_fb;
+                const float u1 = d->fdn_lp[1] * fdn_fb;
+                const float u2 = d->fdn_lp[2] * fdn_fb;
+                const float u3 = d->fdn_lp[3] * fdn_fb;
+
+                const float hsum = 0.5f * (u0 + u1 + u2 + u3);
+                sp->fdn0[fdn0_wr] = (u0 - hsum) + diff_l;
+                sp->fdn1[fdn_wr]  = (u1 - hsum) + diff_r;
+                sp->fdn2[fdn_wr]  = (u2 - hsum) + 0.7f * (diff_l - diff_r);
+                sp->fdn3[fdn_wr]  = (u3 - hsum) + 0.7f * (diff_r + diff_l);
+
+                fdn0_wr = (fdn0_wr + 1u) & SWING_FDN0_MASK;
+                fdn_wr  = (fdn_wr  + 1u) & SWING_FDN_MASK;
+
+                rev_l = hall_wet * 0.52f * (d->fdn_lp[0] + d->fdn_lp[2] - 0.45f * d->fdn_lp[1]);
+                rev_r = hall_wet * 0.52f * (d->fdn_lp[1] + d->fdn_lp[3] - 0.45f * d->fdn_lp[2]);
+            }
+
+            const float sum_l = mic_l + er_l + rev_l;
+            const float sum_r = mic_r + er_r + rev_r;
+
+            const float al = fabsf(mic_l);
+            const float ar = fabsf(mic_r);
+            const float ah = 0.5f * (fabsf(er_l + rev_l) + fabsf(er_r + rev_r));
+            d->prox_env_l = (al > d->prox_env_l) ? (d->prox_env_l + 0.02f * (al - d->prox_env_l))
+                                                 : (d->prox_env_l * 0.9992f);
+            d->prox_env_r = (ar > d->prox_env_r) ? (d->prox_env_r + 0.02f * (ar - d->prox_env_r))
+                                                 : (d->prox_env_r * 0.9992f);
+            d->hall_env   = (ah > d->hall_env)   ? (d->hall_env   + 0.01f * (ah - d->hall_env))
+                                                 : (d->hall_env   * 0.9995f);
+
+            const float y_dc_l = sum_l - d->dc_x_l + dc_r * d->dc_y_l;
+            d->dc_x_l = sum_l;
+            d->dc_y_l = y_dc_l;
+
+            const float y_dc_r = sum_r - d->dc_x_r + dc_r * d->dc_y_r;
+            d->dc_x_r = sum_r;
+            d->dc_y_r = y_dc_r;
+
+            dst[0] = pendulum_soft_limit(y_dc_l);
+            dst[1] = pendulum_soft_limit(y_dc_r);
+            dst += 2;
         }
 
-        d->src_wr = (wr + 1u) & SWING_SRC_MASK;
+        const float inst_cents = clampf(-d_del_last * 1731.234f, -199.0f, 199.0f);
+        d->live_cents += 0.08f * (inst_cents - d->live_cents);
     }
 
-    /* Apply distance/off-axis soundboard radiation low-pass & proximity/ORTF gains */
-    d->air_lp_l = flush_denorm(d->air_lp_l + d->lp_a_l * (dir_l - d->air_lp_l));
-    d->air_lp_r = flush_denorm(d->air_lp_r + d->lp_a_r * (dir_r - d->air_lp_r));
+    d->src_wr   = src_wr;
+    d->ap_wr    = ap_wr;
+    d->fdn0_wr  = fdn0_wr;
+    d->fdn_wr   = fdn_wr;
+    d->mod_ph_a = mod_a;
+    d->mod_ph_b = mod_b;
+    *io_head_i    = head_i;
+    *io_head_f    = head_f;
+    *io_speed_cur = speed_cur;
+    *io_play_gain = pg;
+}
 
-    const float mic_l = d->air_lp_l * d->gain_l;
-    const float mic_r = d->air_lp_r * d->gain_r;
-
-    /* Concert Hall 4-Line Modulated Householder FDN Reverb */
-    float rev_l = 0.0f;
-    float rev_r = 0.0f;
-    if (sp && d->hall_wet > 0.0005f) {
-        const float sc = d->rig_size_scale;
-        const uint32_t apw = d->ap_wr;
-        const float diff_in_l = 0.45f * (mic_l + er_l);
-        const float diff_in_r = 0.45f * (mic_r + er_r);
-
-        const float diff_l = schroeder_allpass(sp->ap_l, apw, SWING_AP_MASK, 347u, 0.58f, diff_in_l);
-        const float diff_r = schroeder_allpass(sp->ap_r, apw, SWING_AP_MASK, 463u, 0.58f, diff_in_r);
-        d->ap_wr = (apw + 1u) & SWING_AP_MASK;
-
-        /* Subtle LFO chorus modulation on FDN lines 2 & 3 (~0.31 Hz and ~0.47 Hz) */
-        d->mod_ph_a += 0.31f * d->inv_fs;
-        if (d->mod_ph_a >= 1.0f) d->mod_ph_a -= 1.0f;
-        d->mod_ph_b += 0.47f * d->inv_fs;
-        if (d->mod_ph_b >= 1.0f) d->mod_ph_b -= 1.0f;
-
-        const float mod_a = 3.2f * sinf(SWING_TWO_PI * d->mod_ph_a);
-        const float mod_b = 3.2f * sinf(SWING_TWO_PI * d->mod_ph_b);
-
-        const uint32_t w0 = d->fdn0_wr;
-        const uint32_t wf = d->fdn_wr;
-
-        const uint32_t tap0 = (uint32_t)(997.0f * sc);
-        const uint32_t tap1 = (uint32_t)(1493.0f * sc);
-        const float    tap2 = 1789.0f * sc + mod_a;
-        const float    tap3 = 2017.0f * sc + mod_b;
-
-        const float r0 = sp->fdn0[(w0 - tap0) & SWING_FDN0_MASK];
-        const float r1 = sp->fdn1[(wf - tap1) & SWING_FDN_MASK];
-        const float r2 = linear_read_ring(sp->fdn2, wf, SWING_FDN_MASK, tap2);
-        const float r3 = linear_read_ring(sp->fdn3, wf, SWING_FDN_MASK, tap3);
-
-        /* Warm felt-hall HF damping on each FDN line */
-        const float damp_a = d->fdn_damp;
-        d->fdn_lp[0] = flush_denorm(d->fdn_lp[0] + damp_a * (r0 - d->fdn_lp[0]));
-        d->fdn_lp[1] = flush_denorm(d->fdn_lp[1] + damp_a * (r1 - d->fdn_lp[1]));
-        d->fdn_lp[2] = flush_denorm(d->fdn_lp[2] + damp_a * (r2 - d->fdn_lp[2]));
-        d->fdn_lp[3] = flush_denorm(d->fdn_lp[3] + damp_a * (r3 - d->fdn_lp[3]));
-
-        const float fb = d->fdn_fb;
-        const float u0 = d->fdn_lp[0] * fb;
-        const float u1 = d->fdn_lp[1] * fb;
-        const float u2 = d->fdn_lp[2] * fb;
-        const float u3 = d->fdn_lp[3] * fb;
-
-        /* Orthogonal 4x4 Householder reflection matrix: H*u = u - 0.5*(u0+u1+u2+u3) */
-        const float hsum = 0.5f * (u0 + u1 + u2 + u3);
-        sp->fdn0[w0] = flush_denorm((u0 - hsum) + diff_l);
-        sp->fdn1[wf] = flush_denorm((u1 - hsum) + diff_r);
-        sp->fdn2[wf] = flush_denorm((u2 - hsum) + 0.7f * (diff_l - diff_r));
-        sp->fdn3[wf] = flush_denorm((u3 - hsum) + 0.7f * (diff_r + diff_l));
-
-        d->fdn0_wr = (w0 + 1u) & SWING_FDN0_MASK;
-        d->fdn_wr  = (wf + 1u) & SWING_FDN_MASK;
-
-        rev_l = d->hall_wet * 0.52f * (d->fdn_lp[0] + d->fdn_lp[2] - 0.45f * d->fdn_lp[1]);
-        rev_r = d->hall_wet * 0.52f * (d->fdn_lp[1] + d->fdn_lp[3] - 0.45f * d->fdn_lp[2]);
-    }
-
-    const float sum_l = mic_l + er_l + rev_l;
-    const float sum_r = mic_r + er_r + rev_r;
-
-    /* Update live proximity & hall bloom envelopes for OLED visualizer */
-    const float al = fabsf(mic_l);
-    const float ar = fabsf(mic_r);
-    const float ah = 0.5f * (fabsf(er_l + rev_l) + fabsf(er_r + rev_r));
-    d->prox_env_l = (al > d->prox_env_l) ? (d->prox_env_l + 0.02f * (al - d->prox_env_l))
-                                         : (d->prox_env_l * 0.9992f);
-    d->prox_env_r = (ar > d->prox_env_r) ? (d->prox_env_r + 0.02f * (ar - d->prox_env_r))
-                                         : (d->prox_env_r * 0.9992f);
-    d->hall_env   = (ah > d->hall_env)   ? (d->hall_env   + 0.01f * (ah - d->hall_env))
-                                         : (d->hall_env   * 0.9995f);
-
-    /* 18 Hz stereo DC blocker + odd-symmetric C1 Pade rational tanh soft limiter */
-    const float y_dc_l = flush_denorm(sum_l - d->dc_x_l + d->dc_r * d->dc_y_l);
-    d->dc_x_l = sum_l;
-    d->dc_y_l = y_dc_l;
-
-    const float y_dc_r = flush_denorm(sum_r - d->dc_x_r + d->dc_r * d->dc_y_r);
-    d->dc_x_r = sum_r;
-    d->dc_y_r = y_dc_r;
-
-    swing_frame_t out = {
-        .l = pendulum_soft_limit(y_dc_l),
-        .r = pendulum_soft_limit(y_dc_r),
+swing_frame_t pendulum_process_frame(pendulum_engine_t* d, swing_frame_t dry) {
+    swing_frame_t loop_one[8] = {
+        dry, dry, dry, dry, dry, dry, dry, dry,
     };
-    return out;
+    volatile int32_t hi = 0;
+    volatile float hf = 0.0f;
+    float sp_cur = 0.0f;
+    float pg = 1.0f;
+    float out2[2] = { 0.0f, 0.0f };
+    pendulum_process_block(d, loop_one, 8u, &hi, &hf, 0.0f, &sp_cur,
+                           1.0f, 0.0f, &pg, out2, 1u);
+    swing_frame_t res = { out2[0], out2[1] };
+    return res;
 }
 
 /* ----------------------------------------------------------------------------
- * Built-In "Seed Felt Piano" Generator (aisatsana [102]-inspired motif)
+ * Built-In "Seed Felt Piano" Generator (chunked & fast aisatsana [102] motif)
  * ------------------------------------------------------------------------- */
 typedef struct {
     float beat;     /* Note onset in beats [0 .. 16) */
@@ -719,11 +833,7 @@ typedef struct {
     float dur_b;    /* Ring duration in beats         */
 } felt_note_t;
 
-/*
- * 4-bar contemplative Cmaj9 -> Am9 -> Fmaj9(#11) -> G6sus4 felt-piano voicing
- * with subtle human rolled micro-timing, wrapping seamlessly across 16 beats.
- */
-static const felt_note_t kAisatsanaNotes[] = {
+static const felt_note_t kAisatsanaNotes[PEND_FELT_NOTES_COUNT] = {
     /* Bar 1: Cmaj9 */
     {  0.00f, 48u, 0.56f, 5.2f },   /* C3  */
     {  0.04f, 55u, 0.44f, 4.8f },   /* G3  */
@@ -758,35 +868,42 @@ static const felt_note_t kAisatsanaNotes[] = {
 };
 
 static float midi_to_hz(uint8_t midi) {
-    /* 440 * 2^((midi - 69)/12) via expf(x * ln(2)) */
     const float semitones = ((float)midi - 69.0f) * (1.0f / 12.0f);
     return 440.0f * expf(semitones * 0.69314718f);
 }
 
-uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float sample_rate) {
+uint32_t pendulum_seed_felt_begin(swing_frame_t* buf, uint32_t max_frames, float sample_rate) {
     if (!buf || max_frames < 1024u) return 0u;
     const float fs = (sample_rate > 8000.0f) ? sample_rate : 48000.0f;
-    const float inv_fs = 1.0f / fs;
 
-    /* Target 9.60s (16 beats @ 100 BPM = 0.60s/beat); scale cleanly if RAM < 9.6s */
     uint32_t target_len = (uint32_t)(9.60f * fs);
     if (target_len > max_frames) target_len = max_frames;
-    /* Align to 16-frame boundary */
     target_len &= ~15u;
     if (target_len < 1024u) return 0u;
 
     memset(buf, 0, (size_t)target_len * sizeof(swing_frame_t));
+    return target_len;
+}
+
+void pendulum_seed_felt_notes(swing_frame_t* buf, uint32_t target_len, float sample_rate,
+                              uint32_t note_start, uint32_t note_count) {
+    if (!buf || target_len < 1024u) return;
+    const float fs = (sample_rate > 8000.0f) ? sample_rate : 48000.0f;
+    const float inv_fs = 1.0f / fs;
 
     const float frames_per_beat = (float)target_len * (1.0f / 16.0f);
-    const uint32_t attack_fr = (uint32_t)(0.0042f * fs) + 4u;    /* ~4.2 ms soft wool hammer */
-    const uint32_t rel_fr    = (uint32_t)(0.0850f * fs) + 8u;    /* 85 ms damper release     */
+    const uint32_t attack_fr = (uint32_t)(0.0042f * fs) + 4u;
+    const uint32_t rel_fr    = (uint32_t)(0.0850f * fs) + 8u;
     const float inv_atk = 1.0f / (float)attack_fr;
     const float inv_rel = 1.0f / (float)rel_fr;
 
-    static const float kPartAmp[6] = { 1.00f, 0.42f, 0.17f, 0.075f, 0.032f, 0.014f };
+    /* 4 warm wool-felt partials (partials >= 5 are damped out by felt blanket) */
+    static const float kPartAmp[4] = { 1.00f, 0.42f, 0.17f, 0.075f };
 
-    const uint32_t num_notes = (uint32_t)(sizeof(kAisatsanaNotes) / sizeof(kAisatsanaNotes[0]));
-    for (uint32_t ni = 0u; ni < num_notes; ++ni) {
+    uint32_t end_note = note_start + note_count;
+    if (end_note > PEND_FELT_NOTES_COUNT) end_note = PEND_FELT_NOTES_COUNT;
+
+    for (uint32_t ni = note_start; ni < end_note; ++ni) {
         const felt_note_t nt = kAisatsanaNotes[ni];
         const float f0 = midi_to_hz(nt.midi);
         const uint32_t onset = ((uint32_t)(nt.beat * frames_per_beat)) % target_len;
@@ -794,48 +911,38 @@ uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float
         if (dur > target_len) dur = target_len;
         if (dur < attack_fr + rel_fr + 16u) continue;
 
-        /* Soundboard note placement (subtle bass-left to treble-right acoustic layout) */
         const float key_pos = clampf(((float)nt.midi - 40.0f) * (1.0f / 36.0f), 0.0f, 1.0f);
         const float pan_l = 0.72f - 0.28f * key_pos;
         const float pan_r = 0.44f + 0.28f * key_pos;
 
-        /* Precompute damped complexphasor multipliers for 6 stiff-string partials + bichord beat */
-        float c_re[6], c_im[6], st_re[6], st_im[6];
-        float b_re, b_im, bst_re, bst_im;
+        float c_re[4], c_im[4], st_re[4], st_im[4];
         const float inharm_b = 0.00028f;
 
-        for (uint32_t p = 0u; p < 6u; ++p) {
+        for (uint32_t p = 0u; p < 4u; ++p) {
             const float k = (float)(p + 1u);
             const float fk = f0 * k * sqrtf(1.0f + inharm_b * k * k);
             if (fk > 0.42f * fs) {
-                st_re[p] = 0.0f;
-                st_im[p] = 0.0f;
-                c_re[p] = 1.0f;
-                c_im[p] = 0.0f;
+                st_re[p] = 0.0f; st_im[p] = 0.0f;
+                c_re[p]  = 1.0f; c_im[p]  = 0.0f;
                 continue;
             }
-            /* Higher partials & higher notes decay faster (warm felt-hammer damping) */
             const float tau = 2.90f / (1.0f + 0.38f * (k - 1.0f) * (k - 1.0f) + 0.0015f * f0);
             const float r_dec = expf(-inv_fs / tau);
             const float w = SWING_TWO_PI * fk * inv_fs;
             c_re[p] = r_dec * cosf(w);
             c_im[p] = r_dec * sinf(w);
             st_re[p] = 0.0f;
-            st_im[p] = kPartAmp[p] * nt.vel * 0.26f;
+            st_im[p] = kPartAmp[p] * nt.vel * 0.27f;
         }
 
-        /* Unison second string detuned by +0.55 cents for intimate acoustic piano shimmer */
-        {
-            const float f_uni = f0 * 1.000318f;
-            const float r_uni = expf(-inv_fs / 2.75f);
-            const float w_uni = SWING_TWO_PI * f_uni * inv_fs;
-            b_re = r_uni * cosf(w_uni);
-            b_im = r_uni * sinf(w_uni);
-            bst_re = 0.0f;
-            bst_im = 0.34f * nt.vel * 0.26f;
-        }
+        const float f_uni = f0 * 1.000318f;
+        const float r_uni = expf(-inv_fs / 2.75f);
+        const float w_uni = SWING_TWO_PI * f_uni * inv_fs;
+        const float b_re  = r_uni * cosf(w_uni);
+        const float b_im  = r_uni * sinf(w_uni);
+        float bst_re = 0.0f;
+        float bst_im = 0.34f * nt.vel * 0.27f;
 
-        /* Subtle woody felt-hammer keybed thump (~148 Hz, ~22 ms decay) */
         const float r_th = expf(-inv_fs / 0.018f);
         const float w_th = SWING_TWO_PI * 148.0f * inv_fs;
         const float th_c_re = r_th * cosf(w_th);
@@ -843,34 +950,45 @@ uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float
         float th_re = 0.0f;
         float th_im = 0.045f * nt.vel;
 
+        const uint32_t thump_end = (uint32_t)(0.12f * fs);
         uint32_t idx = onset;
         const uint32_t rel_start = dur - rel_fr;
 
         for (uint32_t n = 0u; n < dur; ++n) {
-            float s_main = 0.0f;
-            for (uint32_t p = 0u; p < 6u; ++p) {
-                s_main += st_im[p];
-                const float nr = st_re[p] * c_re[p] - st_im[p] * c_im[p];
-                const float ni_im = st_re[p] * c_im[p] + st_im[p] * c_re[p];
-                st_re[p] = nr;
-                st_im[p] = ni_im;
-            }
+            const float s0 = st_im[0];
+            const float nr0 = st_re[0] * c_re[0] - s0 * c_im[0];
+            st_im[0] = st_re[0] * c_im[0] + s0 * c_re[0];
+            st_re[0] = nr0;
+
+            const float s1 = st_im[1];
+            const float nr1 = st_re[1] * c_re[1] - s1 * c_im[1];
+            st_im[1] = st_re[1] * c_im[1] + s1 * c_re[1];
+            st_re[1] = nr1;
+
+            const float s2 = st_im[2];
+            const float nr2 = st_re[2] * c_re[2] - s2 * c_im[2];
+            st_im[2] = st_re[2] * c_im[2] + s2 * c_re[2];
+            st_re[2] = nr2;
+
+            const float s3 = st_im[3];
+            const float nr3 = st_re[3] * c_re[3] - s3 * c_im[3];
+            st_im[3] = st_re[3] * c_im[3] + s3 * c_re[3];
+            st_re[3] = nr3;
 
             const float s_uni = bst_im;
-            {
-                const float nr = bst_re * b_re - bst_im * b_im;
-                const float ni_im = bst_re * b_im + bst_im * b_re;
-                bst_re = nr;
-                bst_im = ni_im;
+            const float nrb = bst_re * b_re - s_uni * b_im;
+            bst_im = bst_re * b_im + s_uni * b_re;
+            bst_re = nrb;
+
+            float s_th = 0.0f;
+            if (n < thump_end) {
+                s_th = th_im;
+                const float nrt = th_re * th_c_re - s_th * th_c_im;
+                th_im = th_re * th_c_im + s_th * th_c_re;
+                th_re = nrt;
             }
 
-            const float s_th = th_im;
-            {
-                const float nr = th_re * th_c_re - th_im * th_c_im;
-                const float ni_im = th_re * th_c_im + th_im * th_c_re;
-                th_re = nr;
-                th_im = ni_im;
-            }
+            const float s_main = s0 + s1 + s2 + s3 + s_th;
 
             float env = 1.0f;
             if (n < attack_fr) {
@@ -881,18 +999,20 @@ uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float
                 env = t * t * (3.0f - 2.0f * t);
             }
 
-            const float sl = env * ((s_main + s_th) * pan_l + s_uni * pan_r);
-            const float sr = env * ((s_main + s_th) * pan_r + s_uni * pan_l);
-
-            buf[idx].l += sl;
-            buf[idx].r += sr;
+            buf[idx].l += env * (s_main * pan_l + s_uni * pan_r);
+            buf[idx].r += env * (s_main * pan_r + s_uni * pan_l);
 
             idx++;
             if (idx >= target_len) idx = 0u;
         }
     }
+}
 
-    /* Gentle warm felt low-pass polish & soft ceiling normalization */
+void pendulum_seed_felt_finish(swing_frame_t* buf, uint32_t target_len, float sample_rate) {
+    if (!buf || target_len < 16u) return;
+    const float fs = (sample_rate > 8000.0f) ? sample_rate : 48000.0f;
+    const float inv_fs = 1.0f / fs;
+
     float lp_l = buf[target_len - 1u].l;
     float lp_r = buf[target_len - 1u].r;
     const float felt_a = clampf(SWING_TWO_PI * 3600.0f * inv_fs, 0.1f, 0.7f);
@@ -902,6 +1022,12 @@ uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float
         buf[i].l = pendulum_soft_limit(lp_l * 1.15f);
         buf[i].r = pendulum_soft_limit(lp_r * 1.15f);
     }
+}
 
+uint32_t pendulum_seed_felt_piano(swing_frame_t* buf, uint32_t max_frames, float sample_rate) {
+    const uint32_t target_len = pendulum_seed_felt_begin(buf, max_frames, sample_rate);
+    if (target_len == 0u) return 0u;
+    pendulum_seed_felt_notes(buf, target_len, sample_rate, 0u, PEND_FELT_NOTES_COUNT);
+    pendulum_seed_felt_finish(buf, target_len, sample_rate);
     return target_len;
 }

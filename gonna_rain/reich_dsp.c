@@ -48,6 +48,13 @@ static inline float reich_smoothstep01(float t) {
     return c * c * (3.0f - 2.0f * c);
 }
 
+/* Fast zero-import sine for normalized phase ph in [0.0f, 1.0f) */
+static inline float reich_sin01(float ph) {
+    const float x = (ph >= 0.5f) ? (ph - 1.0f) : ph; /* [-0.5, +0.5) */
+    const float y = 8.0f * x * (1.0f - 2.0f * fabsf(x));
+    return y * (0.775f + 0.225f * fabsf(y));
+}
+
 float reich_clip_guard(float x) {
     if (!(x > -4.0f && x < 4.0f)) return 0.0f;
     return clampf(x, -1.25f, 1.25f);
@@ -466,15 +473,15 @@ reich_frame_t reich_process_frame(reich_engine_t* d, const reich_frame_t* loop_b
         if (d->flut_ph_b >= 1.0f) d->flut_ph_b -= 1.0f;
 
         const float dep = d->wow_depth_samples;
-        wow_off[0] = dep * (0.80f * sinf(REICH_TWO_PI * d->wow_ph_a) +
-                            0.20f * sinf(REICH_TWO_PI * d->flut_ph_a));
-        wow_off[1] = dep * (0.80f * sinf(REICH_TWO_PI * d->wow_ph_b) +
-                            0.20f * sinf(REICH_TWO_PI * d->flut_ph_b));
+        wow_off[0] = dep * (0.80f * reich_sin01(d->wow_ph_a) +
+                            0.20f * reich_sin01(d->flut_ph_a));
+        wow_off[1] = dep * (0.80f * reich_sin01(d->wow_ph_b) +
+                            0.20f * reich_sin01(d->flut_ph_b));
         if (d->num_decks >= 4u) {
-            wow_off[2] = dep * (0.82f * sinf(REICH_TWO_PI * d->wow_ph_c) -
-                                0.18f * sinf(REICH_TWO_PI * d->flut_ph_a));
-            wow_off[3] = dep * (0.82f * sinf(REICH_TWO_PI * d->wow_ph_d) -
-                                0.18f * sinf(REICH_TWO_PI * d->flut_ph_b));
+            wow_off[2] = dep * (0.82f * reich_sin01(d->wow_ph_c) -
+                                0.18f * reich_sin01(d->flut_ph_a));
+            wow_off[3] = dep * (0.82f * reich_sin01(d->wow_ph_d) -
+                                0.18f * reich_sin01(d->flut_ph_b));
         }
     }
 

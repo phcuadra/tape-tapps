@@ -52,12 +52,15 @@ TAPP_DECLARE_TYPE(AppTypeStandalone);
 #define WAVE_BINS        116u                       /* 116 * 2px = 232px in right panel */
 #define TRAIL_LEN        6u
 #define MAX_MENU_TAKES   32u
+#define UI_FRAME_MS      33u                        /* 30 fps frame-paced UI */
+#define SEED_NOTES_STEP  3u                         /* 3 notes/tick -> 8 smooth frames */
 
 enum {
     ST_STOP = 0,
     ST_PLAY,
     ST_REC,
     ST_LOADING,
+    ST_SEEDING,
 };
 
 enum {
@@ -77,6 +80,7 @@ typedef struct {
     volatile bool     buf_locked;
     volatile bool     swing_on;       /* true = SWINGING drive, false = COASTING free decay */
     volatile bool     rec_done_req;
+    volatile bool     mon_arm_req;
     volatile bool     tape_swapped;
     volatile bool     seed_req;
     volatile bool     push_req;
@@ -106,7 +110,7 @@ typedef struct {
 
     /* Loop playhead & smooth varispeed motor */
     volatile int32_t  head_i;
-    float             head_f;
+    volatile float    head_f;
     float             speed_target;
     float             speed_cur;
     float             play_gain;
@@ -114,10 +118,12 @@ typedef struct {
     /* Core Barbican Pendulum + Hall Acoustic DSP engine */
     pendulum_engine_t dsp;
 
-    /* Chunked SD tape-take loader state */
+    /* Chunked SD tape-take loader & felt-piano seeder state */
     uint32_t          load_src_frame;
     uint32_t          load_total;
     uint32_t          load_done;
+    uint32_t          seed_target_len;
+    uint8_t           seed_note_idx;
 
     /* Bounce-to-tape streaming state (DMA windows) */
     tape_buffer_t*    wb;
@@ -130,13 +136,16 @@ typedef struct {
     uint32_t          bounce_start;
     uint32_t          bounce_limit;
 
-    /* Metering, waveform envelope & pendulum motion trail */
+    /* Metering, waveform envelope, frame pacing & pendulum motion trail */
     volatile float    peak_l;
     volatile float    peak_r;
     uint8_t           wave_bins[WAVE_BINS];
     int8_t            trail_deg[TRAIL_LEN];
     uint32_t          last_tick_ms;
     uint32_t          last_trail_ms;
+    uint32_t          last_draw_ms;
+    uint32_t          anim_until_ms;
+    bool              ui_dirty;
 
     /* 4 live performance encoder parameters */
     params_t          prm[ENC_TOTAL];
@@ -194,32 +203,6 @@ static void apply_loop_splice(swing_frame_t* buf, uint32_t len) {
     }
 }
 
-static inline swing_frame_t loop_read_hermite(const swing_frame_t* buf, int32_t len,
-                                              int32_t i0, float frac) {
-    const int32_t im1 = (i0 > 0) ? (i0 - 1) : (len - 1);
-    const int32_t i1  = (i0 + 1 < len) ? (i0 + 1) : 0;
-    const int32_t i2  = (i1 + 1 < len) ? (i1 + 1) : 0;
-
-    const swing_frame_t ym1 = buf[im1];
-    const swing_frame_t y0  = buf[i0];
-    const swing_frame_t y1  = buf[i1];
-    const swing_frame_t y2  = buf[i2];
-
-    const float c1l = 0.5f * (y1.l - ym1.l);
-    const float c2l = ym1.l - 2.5f * y0.l + 2.0f * y1.l - 0.5f * y2.l;
-    const float c3l = 0.5f * (y2.l - ym1.l) + 1.5f * (y0.l - y1.l);
-
-    const float c1r = 0.5f * (y1.r - ym1.r);
-    const float c2r = ym1.r - 2.5f * y0.r + 2.0f * y1.r - 0.5f * y2.r;
-    const float c3r = 0.5f * (y2.r - ym1.r) + 1.5f * (y0.r - y1.r);
-
-    swing_frame_t out = {
-        .l = ((c3l * frac + c2l) * frac + c1l) * frac + y0.l,
-        .r = ((c3r * frac + c2r) * frac + c1r) * frac + y0.r,
-    };
-    return out;
-}
-
 static void rebuild_waveform_bins(swing_model_t* m) {
     const uint32_t len = m->loop_len;
     if (!m->loop_buf || len < 8u) {
@@ -269,6 +252,7 @@ static void swing_sync_engine_active(swing_model_t* m) {
  * actively capturing (ST_REC), preventing mic bleed or feedback out of speakers.
  */
 static void swing_sync_monitor(swing_model_t* m) {
+    m->in_src = os_audio_get_input();
     const bool want_mon = (m->state == ST_REC) && !m->rec_done_req &&
                           !m->rec_btn_down && (m->rec_holdoff_fr == 0u);
     if (!want_mon) {
@@ -395,7 +379,7 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
     const float* in = mixer_get_record(mix);
     float* send = mixer_get_send(mix);
     const uint32_t fs = mixer_get_fs(mix);
-    if (!out) return;
+    if (!out || fs == 0u) return;
 
     const uint8_t st = m->state;
     const bool locked = m->buf_locked;
@@ -415,124 +399,108 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
     }
 
     if (locked) {
-        for (uint32_t i = 0u; i < fs; i += 2u) {
-            out[i] = 0.0f;
-            out[i + 1u] = 0.0f;
-        }
+        memset(out, 0, (size_t)fs * sizeof(float));
         return;
     }
 
     const float vout = m->vol_out.val;
     const float vfx = m->vol_fx.val;
-    const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
-    const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
-    const float bounce_target = (bouncing && !m->bounce_stop_req) ? 1.0f : 0.0f;
-    const float play_step = 1.0f / 720.0f;       /* ~15 ms anti-click */
-    const float bounce_step = 1.0f / (float)BOUNCE_FADE_FR;
-
-    float* bbuf = bouncing ? tape_buffer_get_ptr(m->wb) : NULL;
     float pl = 0.0f;
     float pr = 0.0f;
 
     swing_frame_t* lbuf = m->loop_buf;
     const uint32_t len = m->loop_len;
 
-    for (uint32_t i = 0u; i < fs; i += 2u) {
-        float ol = 0.0f;
-        float orr = 0.0f;
+    /* Path A: Live 48 kHz recording into PSRAM loop */
+    if (st == ST_REC) {
+        memset(out, 0, (size_t)fs * sizeof(float));
+        if (lbuf && in) {
+            const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
+            for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+                float il = in[i] * itrim;
+                float ir = in[i + 1u] * itrim;
 
-        if (st == ST_REC && lbuf && in) {
-            float il = in[i] * itrim;
-            float ir = in[i + 1u] * itrim;
-
-            if (m->in_src == 1u) {
-                const float hpl = 0.9889f * (m->rec_hp_yl + il - m->rec_hp_xl);
-                const float hpr = 0.9889f * (m->rec_hp_yr + ir - m->rec_hp_xr);
-                m->rec_hp_xl = il;
-                m->rec_hp_yl = (fabsf(hpl) < 1.0e-18f) ? 0.0f : hpl;
-                m->rec_hp_xr = ir;
-                m->rec_hp_yr = (fabsf(hpr) < 1.0e-18f) ? 0.0f : hpr;
-                il = m->rec_hp_yl;
-                ir = m->rec_hp_yr;
-            }
-
-            if (m->rec_btn_down) {
-                m->rec_held_fr++;
-                if (m->rec_held_fr >= MIC_BTN_HELD_MAX_FR) {
-                    m->rec_btn_down = false;
+                if (m->in_src == 1u) {
+                    const float hpl = 0.9889f * (m->rec_hp_yl + il - m->rec_hp_xl);
+                    const float hpr = 0.9889f * (m->rec_hp_yr + ir - m->rec_hp_xr);
+                    m->rec_hp_xl = il;
+                    m->rec_hp_yl = hpl;
+                    m->rec_hp_xr = ir;
+                    m->rec_hp_yr = hpr;
+                    il = hpl;
+                    ir = hpr;
                 }
-            } else if (m->rec_holdoff_fr > 0u) {
-                m->rec_holdoff_fr--;
-            } else {
-                const uint32_t rf = m->rec_frames;
-                if (rf < m->max_frames && !m->rec_done_req) {
-                    float fg = 1.0f;
-                    if (rf < REC_FADE_IN_FR) {
-                        const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR);
-                        fg = t * t * (3.0f - 2.0f * t);
+
+                if (m->rec_btn_down) {
+                    m->rec_held_fr++;
+                    if (m->rec_held_fr >= MIC_BTN_HELD_MAX_FR) {
+                        m->rec_btn_down = false;
                     }
-                    lbuf[rf].l = pendulum_clip_guard(il * fg);
-                    lbuf[rf].r = pendulum_clip_guard(ir * fg);
-                    m->rec_frames = rf + 1u;
-                    if (m->rec_frames >= m->max_frames) {
-                        m->rec_done_req = true;
+                } else if (m->rec_holdoff_fr > 0u) {
+                    m->rec_holdoff_fr--;
+                    if (m->rec_holdoff_fr == 0u) {
+                        m->mon_arm_req = true;
                     }
+                } else {
+                    const uint32_t rf = m->rec_frames;
+                    if (rf < m->max_frames && !m->rec_done_req) {
+                        float fg = 1.0f;
+                        if (rf < REC_FADE_IN_FR) {
+                            const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR);
+                            fg = t * t * (3.0f - 2.0f * t);
+                        }
+                        lbuf[rf].l = pendulum_clip_guard(il * fg);
+                        lbuf[rf].r = pendulum_clip_guard(ir * fg);
+                        m->rec_frames = rf + 1u;
+                        if (m->rec_frames >= m->max_frames) {
+                            m->rec_done_req = true;
+                        }
+                    }
+                    const float al = fabsf(il);
+                    const float ar = fabsf(ir);
+                    if (al > pl) pl = al;
+                    if (ar > pr) pr = ar;
                 }
-                const float al = fabsf(il);
-                const float ar = fabsf(ir);
-                if (al > pl) pl = al;
-                if (ar > pr) pr = ar;
             }
-        } else {
-            /* Smooth tape motor speed & play envelope */
-            m->speed_cur += 0.002f * (m->speed_target - m->speed_cur);
-            float pg = m->play_gain;
-            if (pg < play_target) {
-                pg += play_step;
-                if (pg > play_target) pg = play_target;
-            } else if (pg > play_target) {
-                pg -= play_step;
-                if (pg < play_target) pg = play_target;
-            }
-            m->play_gain = pg;
-
-            if ((pg > 0.0001f || bouncing) && lbuf && len >= 8u) {
-                const int32_t size = (int32_t)len;
-                int32_t i0 = m->head_i;
-                if (i0 < 0 || i0 >= size) i0 = 0;
-                const float frac = m->head_f;
-
-                swing_frame_t dry = { 0.0f, 0.0f };
-                if (pg > 0.0001f) {
-                    dry = loop_read_hermite(lbuf, size, i0, frac);
-                    dry.l *= pg;
-                    dry.r *= pg;
-
-                    float nf = frac + m->speed_cur;
-                    int32_t step = 0;
-                    while (nf >= 1.0f) { nf -= 1.0f; step++; }
-                    while (nf < 0.0f)  { nf += 1.0f; step--; }
-
-                    int32_t next_i = i0 + step;
-                    while (next_i >= size) next_i -= size;
-                    while (next_i < 0)     next_i += size;
-                    m->head_i = next_i;
-                    m->head_f = nf;
-                }
-
-                const swing_frame_t wet = pendulum_process_frame(&m->dsp, dry);
-                ol  = wet.l;
-                orr = wet.r;
-            }
-
-            const float al = fabsf(ol);
-            const float ar = fabsf(orr);
-            if (al > pl) pl = al;
-            if (ar > pr) pr = ar;
         }
+        m->peak_l = (pl > m->peak_l) ? pl : (m->peak_l * 0.85f);
+        m->peak_r = (pr > m->peak_r) ? pr : (m->peak_r * 0.85f);
+        return;
+    }
 
-        /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
-        if (bouncing) {
+    /* Path B: Fused block swinging-piano + Barbican hall engine */
+    const float play_target = (st == ST_PLAY && len >= 8u) ? 1.0f : 0.0f;
+    const float play_step = 1.0f / 720.0f;
+
+    if ((m->play_gain > 0.0001f || play_target > 0.0f || bouncing) && lbuf && len >= 8u) {
+        pendulum_process_block(&m->dsp,
+                               lbuf,
+                               len,
+                               &m->head_i,
+                               &m->head_f,
+                               m->speed_target,
+                               &m->speed_cur,
+                               play_target,
+                               play_step,
+                               &m->play_gain,
+                               out,
+                               fs >> 1);
+    } else {
+        m->play_gain = 0.0f;
+        memset(out, 0, (size_t)fs * sizeof(float));
+    }
+
+    /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
+    if (bouncing) {
+        float* bbuf = tape_buffer_get_ptr(m->wb);
+        const float bounce_target = !m->bounce_stop_req ? 1.0f : 0.0f;
+        const float bounce_step = 1.0f / (float)BOUNCE_FADE_FR;
+        float bg = m->bounce_gain;
+
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
             if (win != m->bounce_cur_win) {
@@ -544,7 +512,6 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
                 bbuf = tape_buffer_get_ptr(m->wb);
             }
 
-            float bg = m->bounce_gain;
             if (bg < bounce_target) {
                 bg += bounce_step;
                 if (bg > bounce_target) bg = bounce_target;
@@ -552,23 +519,41 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
                 bg -= bounce_step;
                 if (bg < bounce_target) bg = bounce_target;
             }
-            m->bounce_gain = bg;
 
             if (bbuf && (bg > 0.0f || !m->bounce_stop_req) && bf < m->bounce_limit) {
                 const uint32_t off = (bf & (TAPE_WINDOW_FR - 1u)) * 2u;
-                bbuf[off]      = clampf(ol * bg, -1.0f, 1.0f);
-                bbuf[off + 1u] = clampf(orr * bg, -1.0f, 1.0f);
+                bbuf[off]      = clampf(ul * bg, -1.0f, 1.0f);
+                bbuf[off + 1u] = clampf(ur * bg, -1.0f, 1.0f);
                 m->bounce_frame = bf + 1u;
             }
         }
+        m->bounce_gain = bg;
+    }
 
-        const float out_l = ol * vout;
-        const float out_r = orr * vout;
-        out[i]      = out_l;
-        out[i + 1u] = out_r;
-        if (send) {
-            send[i]      += out_l * vfx;
-            send[i + 1u] += out_r * vfx;
+    if (send && vfx > 0.0001f) {
+        const float send_g = vout * vfx;
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+            const float al = fabsf(ul);
+            const float ar = fabsf(ur);
+            if (al > pl) pl = al;
+            if (ar > pr) pr = ar;
+            out[i]      = ul * vout;
+            out[i + 1u] = ur * vout;
+            send[i]      += ul * send_g;
+            send[i + 1u] += ur * send_g;
+        }
+    } else {
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+            const float al = fabsf(ul);
+            const float ar = fabsf(ur);
+            if (al > pl) pl = al;
+            if (ar > pr) pr = ar;
+            out[i]      = ul * vout;
+            out[i + 1u] = ur * vout;
         }
     }
 
@@ -693,6 +678,7 @@ static void swing_finish_capture(swing_model_t* m) {
     if (captured < MIN_LOOP_FR) {
         m->state = ST_STOP;
         m->buf_locked = false;
+        m->anim_until_ms = os_tick_get() + 2400u;
         swing_sync_monitor(m);
         swing_sync_engine_active(m);
         swing_hints(m);
@@ -712,34 +698,64 @@ static void swing_finish_capture(swing_model_t* m) {
     swing_hints(m);
 }
 
-static void swing_do_seed_piano(swing_model_t* m) {
+static void swing_start_seed_piano(swing_model_t* m) {
     if (!m->loop_buf || m->max_frames < MIN_LOOP_FR) {
         ui_notify_toast(NotifyWarning, "RAM unavailable", 1800u);
+        m->anim_until_ms = os_tick_get() + 2200u;
         return;
     }
 
     m->buf_locked = true;
     m->state = ST_STOP;
     swing_sync_monitor(m);
+    swing_sync_engine_active(m);
 
-    const uint32_t len = pendulum_seed_felt_piano(m->loop_buf, m->max_frames,
+    const uint32_t len = pendulum_seed_felt_begin(m->loop_buf, m->max_frames,
                                                   (float)TAPP_SAMPLE_RATE);
     if (len < MIN_LOOP_FR) {
         m->buf_locked = false;
         return;
     }
 
-    swing_prepare_fresh_loop(m, len, true);
+    m->seed_target_len = len;
+    m->seed_note_idx = 0u;
+    m->state = ST_SEEDING;
+    m->ui_dirty = true;
+    swing_hints(m);
+}
+
+static void swing_step_seed_piano(swing_model_t* m) {
+    if (!m->loop_buf || m->seed_target_len < MIN_LOOP_FR) {
+        m->state = ST_STOP;
+        m->buf_locked = false;
+        m->ui_dirty = true;
+        return;
+    }
+
+    if (m->seed_note_idx < PEND_FELT_NOTES_COUNT) {
+        pendulum_seed_felt_notes(m->loop_buf, m->seed_target_len, (float)TAPP_SAMPLE_RATE,
+                                 m->seed_note_idx, SEED_NOTES_STEP);
+        uint32_t next_idx = (uint32_t)m->seed_note_idx + SEED_NOTES_STEP;
+        if (next_idx > PEND_FELT_NOTES_COUNT) next_idx = PEND_FELT_NOTES_COUNT;
+        m->seed_note_idx = (uint8_t)next_idx;
+        return;
+    }
+
+    /* Finalize warm felt low-pass, unlock buffer, and start swinging! */
+    pendulum_seed_felt_finish(m->loop_buf, m->seed_target_len, (float)TAPP_SAMPLE_RATE);
+    swing_prepare_fresh_loop(m, m->seed_target_len, true);
     if (!m->swing_on) {
         pendulum_push(&m->dsp, 0.80f);
     }
 
     m->state = ST_PLAY;
     m->buf_locked = false;
+    m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2400u;
     swing_sync_monitor(m);
     swing_sync_engine_active(m);
     swing_hints(m);
-    ui_notify_toast(NotifySuccess, "Seeded Felt Piano [102]", 1800u);
+    ui_notify_toast(NotifySuccess, "Seeded Felt Piano [102]", 1500u);
 }
 
 static void swing_do_clear(swing_model_t* m) {
@@ -801,6 +817,7 @@ static void swing_step_take_load(swing_model_t* m) {
     if (got == 0u) {
         m->state = ST_STOP;
         m->buf_locked = false;
+        m->anim_until_ms = os_tick_get() + 2400u;
         ui_notify_toast(NotifyError, "Tape read failed", 1800u);
         return;
     }
@@ -818,6 +835,8 @@ static void swing_step_take_load(swing_model_t* m) {
         }
         m->state = ST_PLAY;
         m->buf_locked = false;
+        m->ui_dirty = true;
+        m->anim_until_ms = os_tick_get() + 2400u;
         swing_sync_monitor(m);
         swing_sync_engine_active(m);
         swing_hints(m);
@@ -871,6 +890,7 @@ static void menu_act_push(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     swing_model_t* m = (swing_model_t*)ui_menu_ctx(menu);
     m->push_req = true;
+    m->anim_until_ms = os_tick_get() + 2000u;
     ui_menu_hide(menu);
     ui_notify_toast(NotifyInfo, "Pushed piano!", 1400u);
 }
@@ -881,6 +901,7 @@ static void menu_act_center(ui_menu_t* menu, ui_menu_node_t* entry) {
     m->swing_on = false;
     pendulum_set_swing_on(&m->dsp, false);
     m->center_req = true;
+    m->anim_until_ms = os_tick_get() + 2000u;
     ui_menu_hide(menu);
     ui_notify_toast(NotifyInfo, "Centered & still", 1400u);
 }
@@ -1073,6 +1094,9 @@ static void draw_header(gfx_t* gfx, const swing_model_t* m) {
         inv_badge = (((os_tick_get() / 300u) & 1u) == 0u);
     } else if (m->state == ST_LOADING) {
         badge = "LOADING";
+        inv_badge = true;
+    } else if (m->state == ST_SEEDING) {
+        badge = "SEEDING";
         inv_badge = true;
     } else if (m->state == ST_PLAY) {
         if (m->swing_on) {
@@ -1279,16 +1303,20 @@ static void draw_waveform_stage(gfx_t* gfx, const swing_model_t* m) {
     gfx_set_color(gfx, GFX_COLOR_SET);
     gfx_draw_rect_r(gfx, STAGE_X, STAGE_Y, STAGE_W, STAGE_H, 3);
 
-    /* Loading progress view */
-    if (m->state == ST_LOADING) {
+    /* Loading / Seeding progress view */
+    if (m->state == ST_LOADING || m->state == ST_SEEDING) {
         gfx_set_font(gfx, gfx_nunito_semibold_14);
-        const char* msg = "RIGGING TAPE TAKE...";
+        const char* msg = (m->state == ST_SEEDING) ? "SEEDING FELT PIANO [102]..."
+                                                   : "RIGGING TAPE TAKE...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
         gfx_draw_str(gfx, STAGE_X + (STAGE_W - mw) / 2, STAGE_Y + 32, msg);
 
-        const float pct = (m->load_total > 0u)
-                              ? ((float)m->load_done / (float)m->load_total)
-                              : 0.0f;
+        float pct = 0.0f;
+        if (m->state == ST_SEEDING) {
+            pct = (float)m->seed_note_idx * (1.0f / (float)PEND_FELT_NOTES_COUNT);
+        } else if (m->load_total > 0u) {
+            pct = (float)m->load_done / (float)m->load_total;
+        }
         gfx_draw_rect_r(gfx, STAGE_X + 20, STAGE_Y + 46, STAGE_W - 40, 14, 3);
         const int fw = (int)(clampf(pct, 0.0f, 1.0f) * (float)(STAGE_W - 44) + 0.5f);
         if (fw > 0) gfx_draw_rect_fill_r(gfx, STAGE_X + 22, STAGE_Y + 48, fw, 10, 2);
@@ -1469,17 +1497,30 @@ static bool swing_tick(os_app_t* app) {
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
         tape_timeline_set_loop(false);
+        m->ui_dirty = true;
         swing_hints(m);
     }
 
     if (m->seed_req) {
         m->seed_req = false;
-        swing_do_seed_piano(m);
+        swing_start_seed_piano(m);
     }
 
     if (m->clear_req) {
         m->clear_req = false;
         swing_do_clear(m);
+        m->ui_dirty = true;
+        m->anim_until_ms = now_ms + 2200u;
+    }
+
+    if (m->mon_arm_req) {
+        m->mon_arm_req = false;
+        swing_sync_monitor(m);
+    }
+
+    if (m->state == ST_SEEDING) {
+        swing_step_seed_piano(m);
+        return true;
     }
 
     if (m->state == ST_LOADING) {
@@ -1489,6 +1530,7 @@ static bool swing_tick(os_app_t* app) {
 
     if (m->state == ST_REC && m->rec_done_req) {
         swing_finish_capture(m);
+        m->ui_dirty = true;
     }
 
     if (m->bouncing && t) {
@@ -1498,28 +1540,34 @@ static bool swing_tick(os_app_t* app) {
         if ((m->bounce_stop_req && m->bounce_gain <= 0.001f) ||
             m->bounce_frame >= m->bounce_limit) {
             swing_bounce_stop(m, t);
+            m->ui_dirty = true;
+            m->anim_until_ms = now_ms + 2200u;
         }
     }
 
-    m->in_src = os_audio_get_input();
-    swing_sync_monitor(m);
     swing_sync_engine_active(m);
 
     /* Step idle visual pendulum only when audio engine is parked */
+    bool idle_moving = false;
     if (!m->eng_active && m->state == ST_STOP) {
         if (m->push_req) {
             m->push_req = false;
             pendulum_push(&m->dsp, 0.85f);
+            m->ui_dirty = true;
         }
         if (m->center_req) {
             m->center_req = false;
             pendulum_center_still(&m->dsp);
+            m->ui_dirty = true;
         }
-        pendulum_step_idle(&m->dsp, (float)dt_ms * 0.001f);
+        if (m->swing_on || fabsf(m->dsp.theta_x) > 0.005f || fabsf(m->dsp.omega_x) > 0.005f) {
+            pendulum_step_idle(&m->dsp, (float)dt_ms * 0.001f);
+            idle_moving = true;
+        }
     }
 
-    /* Update pendulum motion trail every ~75 ms */
-    if (now_ms - m->last_trail_ms >= 75u) {
+    /* Update pendulum motion trail every ~80 ms */
+    if ((m->state == ST_PLAY || idle_moving) && (now_ms - m->last_trail_ms >= 80u)) {
         m->last_trail_ms = now_ms;
         for (uint32_t k = 0u; k + 1u < TRAIL_LEN; ++k) {
             m->trail_deg[k] = m->trail_deg[k + 1u];
@@ -1536,6 +1584,7 @@ static bool swing_tick(os_app_t* app) {
             param_write_delta_val(p, d);
             param_update_fast(p, m);
             sync_params_to_dsp(m);
+            m->ui_dirty = true;
         }
     }
 
@@ -1552,21 +1601,42 @@ static bool swing_tick(os_app_t* app) {
         m->hint_state = m->state;
         m->hint_swing = m->swing_on;
         m->hint_bounce = m->bouncing;
+        m->ui_dirty = true;
         swing_hints(m);
     }
 
-    return true;
+    const bool toast_win = (m->anim_until_ms != 0u) && ((int32_t)(m->anim_until_ms - now_ms) > 0);
+    const bool animating = (m->state == ST_PLAY || m->state == ST_REC ||
+                            m->bouncing || idle_moving || toast_win);
+    if (m->ui_dirty || (animating && (now_ms - m->last_draw_ms >= UI_FRAME_MS))) {
+        m->ui_dirty = false;
+        m->last_draw_ms = now_ms;
+        return true;
+    }
+
+    return false;
 }
 
 /* ----------------------------------------------------------------------------
- * Input Handler
+ * Input & Resume Handlers
  * ------------------------------------------------------------------------- */
+static void swing_on_resume(os_app_t* app) {
+    swing_model_t* m = (swing_model_t*)os_app_get_model(app);
+    if (!m) return;
+    swing_sync_monitor(m);
+    swing_sync_engine_active(m);
+    m->ui_dirty = true;
+}
+
 static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     swing_model_t* m = (swing_model_t*)os_app_get_model(app);
     if (btn == BTN_ENCODER) return;
 
     if (m->vol_ui) {
-        if (st == KEY_STATE_RELEASED && btn == BTN1) swing_vol_hide(m);
+        if (st == KEY_STATE_RELEASED && btn == BTN1) {
+            swing_vol_hide(m);
+            m->ui_dirty = true;
+        }
         return;
     }
 
@@ -1576,7 +1646,7 @@ static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
         return;
     }
 
-    if (m->state == ST_LOADING) return;
+    if (m->state == ST_LOADING || m->state == ST_SEEDING) return;
 
     if (st == KEY_STATE_PRESSED) {
         switch (btn) {
@@ -1603,6 +1673,7 @@ static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
                 m->buf_locked = true;
                 m->rec_frames = 0u;
                 m->rec_done_req = false;
+                m->mon_arm_req = false;
                 m->rec_manual_stop = false;
                 m->rec_held_fr = 0u;
                 m->rec_hp_xl = m->rec_hp_yl = 0.0f;
@@ -1641,6 +1712,7 @@ static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
             break;
         }
 
+        m->ui_dirty = true;
         m->hint_state = m->state;
         m->hint_swing = m->swing_on;
         m->hint_bounce = m->bouncing;
@@ -1667,32 +1739,50 @@ static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
 static bool swing_app_init(os_app_t* app) {
     swing_model_t* m = (swing_model_t*)os_app_get_model(app);
 
-    /* Allocate 96 KB acoustic delay/FDN workspace + tape read staging buffer first */
+    /*
+     * 1. Allocate 62 KB interleaved delay/FDN workspace, staging buffer, DMA
+     *    window pair, and menu FIRST so OS/UI heap allocations never starve.
+     */
     m->space = (swing_space_t*)os_malloc(sizeof(swing_space_t));
     m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
-
-    /* Allocate PSRAM stereo loop buffer with graceful fallback: 24s -> 16s -> 12s -> 8s -> 4s -> 2s */
-    static const uint32_t kCandSecs[] = { 24u, 16u, 12u, 8u, 6u, 4u, 2u };
-    for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        swing_frame_t* lb = (swing_frame_t*)os_malloc((size_t)frames * sizeof(swing_frame_t));
-        if (lb) {
-            m->loop_buf = lb;
-            m->max_frames = frames;
-            break;
-        }
-    }
-    if (!m->loop_buf) {
-        if (m->read_stage) { os_free(m->read_stage); m->read_stage = NULL; }
-        if (m->space)      { os_free(m->space);      m->space = NULL; }
-        return false;
-    }
 
     tape_t* t = tape_get();
     if (t) {
         m->wb = tape_buffer_init(t);
     }
     m->bounce_cur_win = WIN_NONE;
+
+    m->menu = ui_menu_create(m, menu_root_builder);
+    if (m->menu) {
+        ui_menu_set_name(m->menu, "SWINGING PIANO");
+        ui_menu_set_header(m->menu, true);
+    }
+
+    /*
+     * 2. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 2s)
+     *    while keeping >= 512 KB of free OS heap for menus, notifications & toasts.
+     */
+    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 2u };
+    for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
+        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
+        swing_frame_t* lb = (swing_frame_t*)os_malloc((size_t)frames * sizeof(swing_frame_t));
+        if (!lb) continue;
+        void* heap_guard = os_malloc(512u * 1024u);
+        if (heap_guard) {
+            os_free(heap_guard);
+            m->loop_buf = lb;
+            m->max_frames = frames;
+            break;
+        }
+        os_free(lb);
+    }
+    if (!m->loop_buf) {
+        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
+        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
+        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
+        if (m->space)      { os_free(m->space);        m->space = NULL; }
+        return false;
+    }
 
     /* Initialize Barbican Pendulum + Hall Acoustic DSP engine */
     pendulum_init(&m->dsp, (float)TAPP_SAMPLE_RATE);
@@ -1738,12 +1828,6 @@ static bool swing_app_init(os_app_t* app) {
         tape_timeline_zoom_out();
     }
 
-    m->menu = ui_menu_create(m, menu_root_builder);
-    if (m->menu) {
-        ui_menu_set_name(m->menu, "SWINGING PIANO");
-        ui_menu_set_header(m->menu, true);
-    }
-
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
     m->in_src = os_audio_get_input();
     m->mon_saved = os_audio_get_monitor();
@@ -1758,6 +1842,7 @@ static bool swing_app_init(os_app_t* app) {
     m->hint_state = m->state;
     m->hint_swing = m->swing_on;
     m->hint_bounce = m->bouncing;
+    m->ui_dirty = true;
     swing_hints(m);
 
     os_led_set_pattern(&swing_led_pattern, m);
@@ -1806,4 +1891,5 @@ TAPP_APP("Swinging Piano", swing_model_t, swing_app_init, swing_app_deinit,
          .redraw = swing_redraw,
          .tick = swing_tick,
          .on_input = swing_input,
+         .on_resume = swing_on_resume,
          .engine_cb = &swing_engine_cb);
