@@ -64,3 +64,10 @@ make TAPE_SDK=../tape_sdk
 ```
 
 You can also drag-and-drop any individual app directory (`disintegrate/`, `sitting_in_a_room/`, `gonna_rain/`, `swinging_piano/`, or `pendulum_music/`) onto **[tapp.b.edti.me](https://tapp.b.edti.me)** to build and test in the browser emulator.
+
+---
+
+## License
+
+Released under the [MIT License](./LICENSE).
+
