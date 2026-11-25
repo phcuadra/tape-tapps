@@ -20,7 +20,7 @@
  *
  * Controls:
  *   BTN1 press : Play / Stop (auto-pulls & releases mics if nearly still)
- *   BTN1 hold  : Volume overlay (out @ 25% default / fx send / in / mic trim)
+ *   BTN1 hold  : Volume overlay (out @ 15% default / fx send / in / mic trim)
  *   BTN2 press : Record live input into target pendulum slot M1..M4 (REC-only monitor)
  *   BTN2 hold  : Bounce stereo gallery output to free SD tape space (DMA windows)
  *   BTN3 press : Toggle Mode 1 (fbk: 1:FEEDBACK) <-> Mode 2 (vca: 2:SOUND VCA)
@@ -1712,14 +1712,14 @@ static bool pm_app_init(os_app_t* app) {
         }
     }
 
-    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
-    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 15% = 0.045f / -26.9 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.045f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;
     m->mic_trim = (params_t)PARAM_RANGE("mic trim", 0.40f, 0.05f, 1.50f, 0.02f);
     m->mic_trim.type = ParamValDBType;
-    m->vout_cur = 0.12f;
+    m->vout_cur = 0.045f;
     m->vfx_cur  = 0.0f;
 
     /* Tape timeline strip along bottom edge */

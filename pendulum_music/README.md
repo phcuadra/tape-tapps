@@ -21,7 +21,7 @@ Simulates **4 suspended microphones (`M1..M4`)** swinging on overhead cables abo
 | Control | Action |
 | --- | --- |
 | **BTN1 Press** | `play` / `stop` (auto-pulls & releases the 4 mics if nearly still) |
-| **BTN1 Hold** | Volume overlay (`out` @ `25%` default, `fx send`, `in`, `mic trim`) |
+| **BTN1 Hold** | Volume overlay (`out` @ `15%` default, `fx send`, `in`, `mic trim`) |
 | **BTN2 Press** | `rec` / `done` — capture live Mic/Line audio into target pendulum slot `M1..M4` |
 | **BTN2 Hold** | `bounce` — stream stereo gallery output to free SD tape space via DMA windows |
 | **BTN3 Press** | `fbk` / `vca` — toggle **Mode 1 (`1:FEEDBACK`)** ↔ **Mode 2 (`2:SOUND VCA`)** |

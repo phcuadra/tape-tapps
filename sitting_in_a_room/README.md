@@ -18,7 +18,7 @@ A standalone *tape!* application (`AppTypeStandalone`) modeled after Alvin Lucie
 | Control | Action |
 |---|---|
 | **BTN1 Press** | Play / Stop loop |
-| **BTN1 Hold** | Volume overlay (`out` @ `25%` default, `fx send`, `in`, `mic trim`) |
+| **BTN1 Hold** | Volume overlay (`out` @ `15%` default, `fx send`, `in`, `mic trim`) |
 | **BTN2 Press** | Capture live input into RAM loop (live input is monitored **only** while recording) / Close loop & start `GEN 1` |
 | **BTN2 Hold** | Bounce evolving room loop to free SD tape space (Start / Stop & commit) |
 | **BTN3 Press** | Toggle Re-Record Pass (`rerec`) ON / OFF (30 ms smooth gate; OFF freezes current generation as an infinite drone) |

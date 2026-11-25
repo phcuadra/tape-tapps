@@ -23,7 +23,7 @@ A standalone *tape!* application (`AppTypeStandalone`) inspired by Richard D. Ja
 | Control | Action |
 |---|---|
 | **BTN1 Press** | Play / Stop loop (`play` / `stop`) |
-| **BTN1 Hold** | Volume overlay (`out` @ `25%` default, `fx send`, `in`, `mic trim`) |
+| **BTN1 Hold** | Volume overlay (`out` @ `15%` default, `fx send`, `in`, `mic trim`) |
 | **BTN2 Press** | Capture live input into PSRAM loop (monitored **only** during `ST_REC`) / Close loop & start swinging |
 | **BTN2 Hold** | Bounce live swinging output to free SD tape space via DMA windows (Start / Stop & commit) |
 | **BTN3 Press** | Toggle Sustained Pendulum Drive (`swing` / `SWINGING`) ↔ Free-Pendulum Coast (`coast` / `COASTING`) |

@@ -144,6 +144,8 @@ typedef struct {
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;       /* app-local input trim (0.40x default when Mic) */
+    float             vout_cur;
+    float             vfx_cur;
     volatile bool     vol_ui;
     bool              mon_saved;      /* user's monitor state saved at launch, restored at exit */
     bool              wet_saved;      /* user's WET state saved at launch, restored at exit */
@@ -415,8 +417,11 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
         return;
     }
 
-    const float vout = m->vol_out.val;
-    const float vfx = m->vol_fx.val;
+    const float vout_tgt = m->vol_out.val;
+    const float vfx_tgt  = m->vol_fx.val;
+    float vo = m->vout_cur;
+    float vf = m->vfx_cur;
+    const float vol_slew = 0.0045f;
     const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
     const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
     const float bounce_target = (bouncing && !m->bounce_stop_req) ? 1.0f : 0.0f;
@@ -538,15 +543,22 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
             }
         }
 
-        const float out_l = ol * vout;
-        const float out_r = orr * vout;
+        vo += vol_slew * (vout_tgt - vo);
+        vf += vol_slew * (vfx_tgt  - vf);
+        const float out_l = ol * vo;
+        const float out_r = orr * vo;
         out[i]      = out_l;
         out[i + 1u] = out_r;
         if (send) {
-            send[i]      += out_l * vfx;
-            send[i + 1u] += out_r * vfx;
+            send[i]      += out_l * vf;
+            send[i + 1u] += out_r * vf;
         }
     }
+
+    if (fabsf(vout_tgt - vo) < 1.0e-5f) vo = vout_tgt;
+    if (fabsf(vfx_tgt  - vf) < 1.0e-5f) vf = vfx_tgt;
+    m->vout_cur = vo;
+    m->vfx_cur  = vf;
 
     m->peak_l = (pl > m->peak_l) ? pl : (m->peak_l * 0.85f);
     m->peak_r = (pr > m->peak_r) ? pr : (m->peak_r * 0.85f);
@@ -1725,13 +1737,15 @@ static bool rain_app_init(os_app_t* app) {
     m->enc_sel = ENC_DRIFT;
     sync_params_to_dsp(m);
 
-    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
-    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 15% = 0.045f / -26.9 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.045f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;
     m->mic_trim = (params_t)PARAM_RANGE("mic trim", 0.40f, 0.05f, 1.50f, 0.02f);
     m->mic_trim.type = ParamValDBType;
+    m->vout_cur = 0.045f;
+    m->vfx_cur  = 0.0f;
 
     /* Tape timeline strip along bottom edge */
     m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);

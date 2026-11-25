@@ -155,6 +155,8 @@ typedef struct {
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;       /* app-local input trim (0.40f default when Mic) */
+    float             vout_cur;
+    float             vfx_cur;
     volatile bool     vol_ui;
     bool              mon_saved;      /* user's monitor state saved at init, restored at exit */
     bool              wet_saved;      /* user's WET state saved at init, restored at exit */
@@ -403,8 +405,8 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
         return;
     }
 
-    const float vout = m->vol_out.val;
-    const float vfx = m->vol_fx.val;
+    const float vout_tgt = m->vol_out.val;
+    const float vfx_tgt  = m->vol_fx.val;
     float pl = 0.0f;
     float pr = 0.0f;
 
@@ -413,6 +415,8 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
 
     /* Path A: Live 48 kHz recording into PSRAM loop */
     if (st == ST_REC) {
+        m->vout_cur = vout_tgt;
+        m->vfx_cur  = vfx_tgt;
         memset(out, 0, (size_t)fs * sizeof(float));
         if (lbuf && in) {
             const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
@@ -487,6 +491,8 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
                                fs >> 1);
     } else {
         m->play_gain = 0.0f;
+        m->vout_cur  = vout_tgt;
+        m->vfx_cur   = vfx_tgt;
         memset(out, 0, (size_t)fs * sizeof(float));
     }
 
@@ -530,32 +536,46 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
         m->bounce_gain = bg;
     }
 
-    if (send && vfx > 0.0001f) {
-        const float send_g = vout * vfx;
+    float vo = m->vout_cur;
+    float vf = m->vfx_cur;
+    const float vol_slew = 0.0045f;
+
+    if (send && (vfx_tgt > 0.0001f || vf > 0.0001f)) {
         for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            vo += vol_slew * (vout_tgt - vo);
+            vf += vol_slew * (vfx_tgt  - vf);
             const float ul = out[i];
             const float ur = out[i + 1u];
             const float al = fabsf(ul);
             const float ar = fabsf(ur);
             if (al > pl) pl = al;
             if (ar > pr) pr = ar;
-            out[i]      = ul * vout;
-            out[i + 1u] = ur * vout;
-            send[i]      += ul * send_g;
-            send[i + 1u] += ur * send_g;
+            const float out_l = ul * vo;
+            const float out_r = ur * vo;
+            out[i]       = out_l;
+            out[i + 1u]  = out_r;
+            send[i]      += out_l * vf;
+            send[i + 1u] += out_r * vf;
         }
     } else {
+        vf = vfx_tgt;
         for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            vo += vol_slew * (vout_tgt - vo);
             const float ul = out[i];
             const float ur = out[i + 1u];
             const float al = fabsf(ul);
             const float ar = fabsf(ur);
             if (al > pl) pl = al;
             if (ar > pr) pr = ar;
-            out[i]      = ul * vout;
-            out[i + 1u] = ur * vout;
+            out[i]      = ul * vo;
+            out[i + 1u] = ur * vo;
         }
     }
+
+    if (fabsf(vout_tgt - vo) < 1.0e-5f) vo = vout_tgt;
+    if (fabsf(vfx_tgt  - vf) < 1.0e-5f) vf = vfx_tgt;
+    m->vout_cur = vo;
+    m->vfx_cur  = vf;
 
     m->peak_l = (pl > m->peak_l) ? pl : (m->peak_l * 0.85f);
     m->peak_r = (pr > m->peak_r) ? pr : (m->peak_r * 0.85f);
@@ -1805,13 +1825,15 @@ static bool swing_app_init(os_app_t* app) {
         m->trail_deg[k] = (int8_t)m->dsp.live_deg_x;
     }
 
-    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
-    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 15% = 0.045f / -26.9 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.045f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;
     m->mic_trim = (params_t)PARAM_RANGE("mic trim", 0.40f, 0.05f, 1.50f, 0.02f);
     m->mic_trim.type = ParamValDBType;
+    m->vout_cur = 0.045f;
+    m->vfx_cur  = 0.0f;
 
     /* Tape timeline strip along bottom edge */
     m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
