@@ -554,8 +554,8 @@ static void dis_process(void* restrict ctx, mixer_t* restrict mix) {
                 sl = dis_soft_clip_guard(sl);
                 sr = dis_soft_clip_guard(sr);
 
-                ol = sl * pg * vout;
-                orr = sr * pg * vout;
+                ol = sl * pg;
+                orr = sr * pg;
 
                 /* Advance integer + fractional playhead */
                 float nf = frac + m->speed_cur;
@@ -586,7 +586,7 @@ static void dis_process(void* restrict ctx, mixer_t* restrict mix) {
             if (ar > pr) pr = ar;
         }
 
-        /* Optional Bounce-to-Tape streaming write */
+        /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
         if (bouncing) {
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
@@ -617,11 +617,13 @@ static void dis_process(void* restrict ctx, mixer_t* restrict mix) {
             }
         }
 
-        out[i] = ol;
-        out[i + 1] = orr;
+        const float out_l = ol * vout;
+        const float out_r = orr * vout;
+        out[i] = out_l;
+        out[i + 1] = out_r;
         if (send) {
-            send[i]     += ol * vfx;
-            send[i + 1] += orr * vfx;
+            send[i]     += out_l * vfx;
+            send[i + 1] += out_r * vfx;
         }
     }
 
@@ -1638,8 +1640,8 @@ static bool dis_app_init(os_app_t* app) {
     m->speed_target = 1.0f;
     sync_params_to_dsp(m);
 
-    /* Volume overlay & mic capture trim params */
-    m->vol_out = (params_t)PARAM_RANGE("out", 1.0f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;

@@ -497,8 +497,8 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
                 const bool allow_drift = (st == ST_PLAY) && !m->unison_intro;
                 const reich_frame_t ph = reich_process_frame(&m->dsp, lbuf, m->speed_cur, allow_drift);
 
-                ol  = ph.l * pg * vout;
-                orr = ph.r * pg * vout;
+                ol  = ph.l * pg;
+                orr = ph.r * pg;
             }
 
             const float al = fabsf(ol);
@@ -507,7 +507,7 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
             if (ar > pr) pr = ar;
         }
 
-        /* Optional Bounce-to-Tape streaming write */
+        /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
         if (bouncing) {
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
@@ -538,11 +538,13 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
             }
         }
 
-        out[i]      = ol;
-        out[i + 1u] = orr;
+        const float out_l = ol * vout;
+        const float out_r = orr * vout;
+        out[i]      = out_l;
+        out[i + 1u] = out_r;
         if (send) {
-            send[i]      += ol * vfx;
-            send[i + 1u] += orr * vfx;
+            send[i]      += out_l * vfx;
+            send[i + 1u] += out_r * vfx;
         }
     }
 
@@ -1723,8 +1725,8 @@ static bool rain_app_init(os_app_t* app) {
     m->enc_sel = ENC_DRIFT;
     sync_params_to_dsp(m);
 
-    /* Volume overlay & mic capture trim params */
-    m->vol_out = (params_t)PARAM_RANGE("out", 1.0f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;

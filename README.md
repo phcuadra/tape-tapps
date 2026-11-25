@@ -43,6 +43,8 @@ All five standalone apps share a unified hardware interface and handheld-mic rec
   - Live input monitoring (`os_audio_set_monitor`) and firmware WET FX pass-through (`os_audio_set_wet`) are kept strictly **OFF** while stopped or playing so the built-in microphone never bleeds through the speakers, engaging only during active recording (`ST_REC`) and restoring your system settings on exit.
 - **Tamed Mic Gain + `Mic Trim`**:
   - Automatically caps hot hardware mic gain on launch/input-switch while respecting manual `in` adjustments, and provides an app-local dB **`Mic Trim`** control (`0.40x` / ~`-8 dB` default) in both the Volume overlay and App Menu.
+- **Headphone-Safe `25%` Default Output Volume**:
+  - Output trim (`out`) defaults to **`25%`** (`0.12x` / `-18.4 dB` on *tape!*'s dB fader taper instead of `75%` / `0 dB` full scale) for comfortable headphone listening, while **Bounce-to-Tape** continues to capture the pre-trim unity signal at full `0 dB` resolution.
 - **4-Layer Mechanical Button-Pop Suppression (Built-In Mic)**:
   - Blanks capture and monitoring until **`85 ms` after `BTN2` is released** on record start (followed by a `25 ms` smoothstep fade-in), trims the final **`110 ms`** of pre-debounce switch-click audio on manual record stop, runs an **`85 Hz`** chassis-thump/DC high-pass filter on mic captures, and applies a **`20 ms`** smoothstep loop splice.
 

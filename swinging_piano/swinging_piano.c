@@ -521,8 +521,8 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
                 }
 
                 const swing_frame_t wet = pendulum_process_frame(&m->dsp, dry);
-                ol  = wet.l * vout;
-                orr = wet.r * vout;
+                ol  = wet.l;
+                orr = wet.r;
             }
 
             const float al = fabsf(ol);
@@ -531,7 +531,7 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
             if (ar > pr) pr = ar;
         }
 
-        /* Optional Bounce-to-Tape streaming write */
+        /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
         if (bouncing) {
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
@@ -562,11 +562,13 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
             }
         }
 
-        out[i]      = ol;
-        out[i + 1u] = orr;
+        const float out_l = ol * vout;
+        const float out_r = orr * vout;
+        out[i]      = out_l;
+        out[i + 1u] = out_r;
         if (send) {
-            send[i]      += ol * vfx;
-            send[i + 1u] += orr * vfx;
+            send[i]      += out_l * vfx;
+            send[i + 1u] += out_r * vfx;
         }
     }
 
@@ -1713,8 +1715,8 @@ static bool swing_app_init(os_app_t* app) {
         m->trail_deg[k] = (int8_t)m->dsp.live_deg_x;
     }
 
-    /* Volume overlay & mic capture trim params */
-    m->vol_out = (params_t)PARAM_RANGE("out", 1.0f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;

@@ -529,8 +529,8 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
                 const float wr_en = (gg > 0.0001f) ? 1.0f : 0.0f;
                 const lucier_frame_t next_gen = lucier_process_frame(&m->dsp, dry, wr_en);
 
-                ol  = next_gen.l * pg * vout;
-                orr = next_gen.r * pg * vout;
+                ol  = next_gen.l * pg;
+                orr = next_gen.r * pg;
 
                 /* Advance integer + fractional playhead */
                 float nf = frac + m->speed_cur;
@@ -574,7 +574,7 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
             if (ar > pr) pr = ar;
         }
 
-        /* Optional Bounce-to-Tape streaming write */
+        /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
         if (bouncing) {
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
@@ -605,11 +605,13 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
             }
         }
 
-        out[i] = ol;
-        out[i + 1] = orr;
+        const float out_l = ol * vout;
+        const float out_r = orr * vout;
+        out[i] = out_l;
+        out[i + 1] = out_r;
         if (send) {
-            send[i]     += ol * vfx;
-            send[i + 1] += orr * vfx;
+            send[i]     += out_l * vfx;
+            send[i + 1] += out_r * vfx;
         }
     }
 
@@ -1680,8 +1682,8 @@ static bool sit_app_init(os_app_t* app) {
     m->enc_sel = ENC_PASS;
     sync_params_to_dsp(m);
 
-    /* Volume overlay & mic capture trim params */
-    m->vol_out = (params_t)PARAM_RANGE("out", 1.0f, 0.0f, 2.0f, 0.02f);
+    /* Volume overlay (default 25% = 0.12f / -18.4 dB for headphones) & mic trim */
+    m->vol_out = (params_t)PARAM_RANGE("out", 0.12f, 0.0f, 2.0f, 0.02f);
     m->vol_out.type = ParamValDBType;
     m->vol_fx = (params_t)PARAM_RANGE("fx send", 0.0f, 0.0f, 1.0f, 0.02f);
     m->vol_fx.type = ParamValDBType;
