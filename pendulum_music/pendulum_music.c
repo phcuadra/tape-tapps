@@ -8,8 +8,7 @@
  * above 4 upward-facing floor speakers in a shared gallery space with a
  * frame-interleaved 4x4 3D acoustic propagation matrix, inter-mic
  * constructive/destructive phase interference, Barkhausen/Doppler pitch glides,
- * gradual decay into a continuous 4-voice resting feedback chord, and the
- * iconic "Pull Power Plug" ending.
+ * and gradual decay into a continuous 4-voice resting feedback chord.
  *
  * Two Live Performance Modes (instant 20 ms crossfade via BTN3 press):
  *   1. 1:FEEDBACK  — Output IS the stereo gallery mix of the 4 coupled
@@ -20,13 +19,13 @@
  *                    tape takes loaded onto M1..M4).
  *
  * Controls:
- *   BTN1 press : Play / Stop (auto-pulls & releases mics if still or unplugged)
+ *   BTN1 press : Play / Stop (auto-pulls & releases mics if nearly still)
  *   BTN1 hold  : Volume overlay (out @ 25% default / fx send / in / mic trim)
  *   BTN2 press : Record live input into target pendulum slot M1..M4 (REC-only monitor)
  *   BTN2 hold  : Bounce stereo gallery output to free SD tape space (DMA windows)
  *   BTN3 press : Toggle Mode 1 (fbk: 1:FEEDBACK) <-> Mode 2 (vca: 2:SOUND VCA)
- *   BTN3 hold  : Menu (Pull & Release, Pull Power Plug, Mode, Sound Bank,
- *                Rec Target, Load Tape Take -> Mic X, Load Takes 1-4 -> M1-M4,
+ *   BTN3 hold  : Menu (Pull & Release, Mode, Sound Bank, Rec Target,
+ *                Load Tape Take -> Mic X, Load Takes 1-4 -> M1-M4,
  *                Release Unison/Staggered, Tuning, Input Line/Mic, Mic Trim, Re-Seed)
  *   BTN4 / 5   : Select encoder parameter (GAIN, COUPLE, SPREAD, DECAY)
  *   ENCODER    : Adjust selected parameter
@@ -61,7 +60,8 @@ TAPP_DECLARE_TYPE(AppTypeStandalone);
 #define COMMIT_TRIM_POS       64u
 #define LOAD_CHUNK_FR48       2048u                     /* ~42 ms per tick during tape_read */
 
-#define UI_FRAME_MS           33u                       /* 30 fps smooth frame-paced UI */
+#define UI_FRAME_MS           40u                       /* 25 fps smooth frame-paced UI */
+#define UI_VOL_FRAME_MS       80u                       /* 12.5 fps while volume bar animates */
 #define TRAIL_LEN             2u
 #define MAX_MENU_TAKES        20u
 
@@ -86,7 +86,7 @@ enum {
 };
 
 /* ----------------------------------------------------------------------------
- * App Model (~2.8 KB in internal SRAM; audio loops in PSRAM, 11.5 KB space in SRAM)
+ * App Model (~10.4 KB in zero-wait-state internal SRAM; custom loops in PSRAM)
  * ------------------------------------------------------------------------- */
 typedef struct {
     /* Transport & cross-thread request flags */
@@ -97,12 +97,13 @@ typedef struct {
     volatile bool     mon_arm_req;      /* set by audio when post-BTN2 holdoff finishes */
     volatile bool     tape_swapped;
     volatile bool     pull_req;
-    volatile bool     plug_req;
     volatile bool     seed_req;
     volatile bool     eng_active;
 
-    /* Workspace: 11.5 KB hot delay space + 4 stereo 24 kHz sound slots + staging */
-    pend_space_t*     space;
+    /* Hot 7.5 KB delay/room workspace embedded directly in fast internal SRAM! */
+    pend_space_t      space;
+
+    /* 4 custom 24 kHz sound slots in PSRAM + SD read staging */
     pm_frame_t*       slots_mem;
     pm_frame_t*       slot_buf[PM_NUM_MICS];
     float*            read_stage;
@@ -128,9 +129,11 @@ typedef struct {
     float             rec_hp_xr;
     float             rec_hp_yr;
 
-    /* Smooth audio crossfaders */
+    /* Smooth audio crossfaders & per-sample anti-zipper volume followers */
     float             play_gain;
     float             mode_mix;         /* 0.0 = Mode 1 Feedback, 1.0 = Mode 2 VCA */
+    float             vout_cur;
+    float             vfx_cur;
 
     /* Core 4-pendulum coupled acoustic feedback DSP engine (runs at 24 kHz) */
     reich_pendulum_dsp_t dsp;
@@ -163,6 +166,7 @@ typedef struct {
     int8_t            trail_deg[PM_NUM_MICS][TRAIL_LEN];
     uint32_t          last_trail_ms;
     uint32_t          last_draw_ms;
+    uint32_t          anim_until_ms;
     bool              ui_dirty;
 
     /* Cached header & card text so redraw() avoids per-frame snprintf/measure */
@@ -334,7 +338,7 @@ static void pm_bounce_start(pm_model_t* m) {
     tape_timeline_set_loop(false);
 
     if (m->state == ST_STOP) {
-        if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
+        if (pm_all_nearly_still(&m->dsp, 3.0f)) {
             m->pull_req = true;
         }
         m->state = ST_PLAY;
@@ -342,6 +346,7 @@ static void pm_bounce_start(pm_model_t* m) {
 
     m->bouncing = true;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2400u;
     pm_sync_engine_active(m);
     pm_hints(m);
     ui_notify_toast(NotifyInfo, "Bouncing Pendulum Music", 1800u);
@@ -372,6 +377,7 @@ static void pm_bounce_stop(pm_model_t* m, tape_t* t) {
     }
 
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2400u;
     pm_sync_engine_active(m);
     pm_hints(m);
 }
@@ -403,23 +409,21 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
         m->pull_req = false;
         pm_pull_and_release(&m->dsp);
     }
-    if (m->plug_req) {
-        m->plug_req = false;
-        pm_pull_plug(&m->dsp);
-    }
 
     if (locked) {
         memset(out, 0, (size_t)fs * sizeof(float));
         return;
     }
 
-    const float vout = m->vol_out.val;
-    const float vfx = m->vol_fx.val;
+    const float vout_tgt = m->vol_out.val;
+    const float vfx_tgt  = m->vol_fx.val;
     float pl = 0.0f;
     float pr = 0.0f;
 
     /* Path A: Live 48k -> 24k decimated slot capture (output is muted during ST_REC) */
     if (st == ST_REC) {
+        m->vout_cur = vout_tgt;
+        m->vfx_cur  = vfx_tgt;
         memset(out, 0, (size_t)fs * sizeof(float));
 
         const uint8_t rslot = m->rec_slot & 3u;
@@ -482,8 +486,10 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
     const float play_target = (st == ST_PLAY) ? 1.0f : 0.0f;
     const float mode_target = (m->mode == PM_MODE_SOUND_VCA) ? 1.0f : 0.0f;
 
-    if (!m->space || (m->play_gain <= 0.0001f && play_target == 0.0f && !bouncing)) {
+    if (m->play_gain <= 0.0001f && play_target == 0.0f && !bouncing) {
         m->play_gain = 0.0f;
+        m->vout_cur  = vout_tgt;
+        m->vfx_cur   = vfx_tgt;
         m->ups.prev_l = 0.0f;
         m->ups.prev_r = 0.0f;
         memset(out, 0, (size_t)fs * sizeof(float));
@@ -496,7 +502,7 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
 
     const float play_step24 = 1.0f / 360.0f;    /* 15 ms play/stop ramp at 24 kHz */
     const float mode_step24 = 1.0f / 480.0f;    /* 20 ms mode crossfade at 24 kHz */
-    float* const scratch24 = m->space->scratch24;
+    float* const scratch24 = m->space.scratch24;
 
     uint32_t pos48 = 0u;
     while (pos48 + 3u < fs) {
@@ -526,7 +532,7 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
         pos48 += rem48;
     }
 
-    /* Optional Bounce-to-Tape (unity pre-vout level) + headphone trim + FX send */
+    /* Optional Bounce-to-Tape (unity pre-vout level) + per-sample smoothed headphone trim */
     if (bouncing) {
         float* bbuf = tape_buffer_get_ptr(m->wb);
         const float bounce_target = !m->bounce_stop_req ? 1.0f : 0.0f;
@@ -566,32 +572,46 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
         m->bounce_gain = bg;
     }
 
-    if (send && vfx > 0.0001f) {
-        const float send_g = vout * vfx;
+    float vo = m->vout_cur;
+    float vf = m->vfx_cur;
+    const float vol_slew = 0.0045f; /* ~4.6 ms anti-zipper 1-pole at 48 kHz */
+
+    if (send && (vfx_tgt > 0.0001f || vf > 0.0001f)) {
         for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            vo += vol_slew * (vout_tgt - vo);
+            vf += vol_slew * (vfx_tgt  - vf);
             const float ul = out[i];
             const float ur = out[i + 1u];
             const float al = fabsf(ul);
             const float ar = fabsf(ur);
             if (al > pl) pl = al;
             if (ar > pr) pr = ar;
-            out[i]      = ul * vout;
-            out[i + 1u] = ur * vout;
-            send[i]      += ul * send_g;
-            send[i + 1u] += ur * send_g;
+            const float out_l = ul * vo;
+            const float out_r = ur * vo;
+            out[i]       = out_l;
+            out[i + 1u]  = out_r;
+            send[i]      += out_l * vf;
+            send[i + 1u] += out_r * vf;
         }
     } else {
+        vf = vfx_tgt;
         for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            vo += vol_slew * (vout_tgt - vo);
             const float ul = out[i];
             const float ur = out[i + 1u];
             const float al = fabsf(ul);
             const float ar = fabsf(ur);
             if (al > pl) pl = al;
             if (ar > pr) pr = ar;
-            out[i]      = ul * vout;
-            out[i + 1u] = ur * vout;
+            out[i]      = ul * vo;
+            out[i + 1u] = ur * vo;
         }
     }
+
+    if (fabsf(vout_tgt - vo) < 1.0e-5f) vo = vout_tgt;
+    if (fabsf(vfx_tgt  - vf) < 1.0e-5f) vf = vfx_tgt;
+    m->vout_cur = vo;
+    m->vfx_cur  = vf;
 
     m->peak_l = (pl > m->peak_l) ? pl : (m->peak_l * 0.85f);
     m->peak_r = (pr > m->peak_r) ? pr : (m->peak_r * 0.85f);
@@ -671,7 +691,7 @@ static void pm_led_step(const os_led_t* led, const void* ctx) {
 static led_pattern_t pm_led_pattern = {
     .callback = pm_led_step,
     .steps = 255u,
-    .rate = 40u,
+    .rate = 20u,
     .loop = true,
 };
 
@@ -690,6 +710,7 @@ static void pm_do_seed_bank(pm_model_t* m, bool show_toast) {
     if (show_toast) {
         char msg[32];
         snprintf(msg, sizeof(msg), "Bank: %s", pm_bank_name(m->bank_idx));
+        m->anim_until_ms = os_tick_get() + 2200u;
         ui_notify_toast(NotifySuccess, msg, 1500u);
     }
 }
@@ -714,6 +735,7 @@ static void pm_finish_capture(pm_model_t* m) {
         m->state = ST_STOP;
         m->buf_locked = false;
         m->ui_dirty = true;
+        m->anim_until_ms = os_tick_get() + 2400u;
         pm_sync_monitor(m);
         pm_sync_engine_active(m);
         pm_hints(m);
@@ -729,13 +751,14 @@ static void pm_finish_capture(pm_model_t* m) {
 
     m->mode = PM_MODE_SOUND_VCA;
     m->rec_slot = (uint8_t)((slot + 1u) & 3u);
-    if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
+    if (pm_all_nearly_still(&m->dsp, 3.0f)) {
         m->pull_req = true;
     }
 
     m->state = ST_PLAY;
     m->buf_locked = false;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2400u;
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     pm_hints(m);
@@ -765,11 +788,13 @@ static bool pm_prep_single_take(pm_model_t* m, tape_t* t, uint32_t take_idx, uin
 static void pm_start_take_load(pm_model_t* m, uint32_t take_idx, bool batch_first_four) {
     tape_t* t = tape_get();
     if (!t || !m->slots_mem || !m->read_stage) {
+        m->anim_until_ms = os_tick_get() + 2400u;
         ui_notify_toast(NotifyWarning, "Tape unavailable", 1800u);
         return;
     }
     const uint32_t n = tape_marks_count(t);
     if (n == 0u) {
+        m->anim_until_ms = os_tick_get() + 2400u;
         ui_notify_toast(NotifyWarning, "No tape takes", 1800u);
         return;
     }
@@ -782,6 +807,7 @@ static void pm_start_take_load(pm_model_t* m, uint32_t take_idx, bool batch_firs
         m->load_batch_cnt = cnt;
         if (!pm_prep_single_take(m, t, 0u, 0u)) {
             m->buf_locked = false;
+            m->anim_until_ms = os_tick_get() + 2400u;
             ui_notify_toast(NotifyWarning, "Take 1 too short", 1800u);
             return;
         }
@@ -789,6 +815,7 @@ static void pm_start_take_load(pm_model_t* m, uint32_t take_idx, bool batch_firs
         m->load_batch_mode = false;
         if (!pm_prep_single_take(m, t, take_idx, m->rec_slot)) {
             m->buf_locked = false;
+            m->anim_until_ms = os_tick_get() + 2400u;
             ui_notify_toast(NotifyWarning, "Take too short", 1800u);
             return;
         }
@@ -821,6 +848,7 @@ static void pm_step_take_load(pm_model_t* m) {
         m->state = ST_STOP;
         m->buf_locked = false;
         m->ui_dirty = true;
+        m->anim_until_ms = os_tick_get() + 2400u;
         ui_notify_toast(NotifyError, "Tape read failed", 1800u);
         return;
     }
@@ -856,12 +884,13 @@ static void pm_step_take_load(pm_model_t* m) {
                 m->load_batch_idx++;
             }
             m->mode = PM_MODE_SOUND_VCA;
-            if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
+            if (pm_all_nearly_still(&m->dsp, 3.0f)) {
                 m->pull_req = true;
             }
             m->state = ST_PLAY;
             m->buf_locked = false;
             m->ui_dirty = true;
+            m->anim_until_ms = os_tick_get() + 2400u;
             pm_sync_monitor(m);
             pm_sync_engine_active(m);
             pm_hints(m);
@@ -869,12 +898,13 @@ static void pm_step_take_load(pm_model_t* m) {
         } else {
             m->mode = PM_MODE_SOUND_VCA;
             m->rec_slot = (uint8_t)((dst + 1u) & 3u);
-            if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
+            if (pm_all_nearly_still(&m->dsp, 3.0f)) {
                 m->pull_req = true;
             }
             m->state = ST_PLAY;
             m->buf_locked = false;
             m->ui_dirty = true;
+            m->anim_until_ms = os_tick_get() + 2400u;
             pm_sync_monitor(m);
             pm_sync_engine_active(m);
             pm_hints(m);
@@ -894,20 +924,12 @@ static void menu_act_pull_release(ui_menu_t* menu, ui_menu_node_t* entry) {
     m->pull_req = true;
     m->state = ST_PLAY;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2200u;
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     pm_hints(m);
     ui_menu_hide(menu);
     ui_notify_toast(NotifyInfo, "Released 4 microphones", 1500u);
-}
-
-static void menu_act_pull_plug(ui_menu_t* menu, ui_menu_node_t* entry) {
-    (void)entry;
-    pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
-    m->plug_req = true;
-    m->ui_dirty = true;
-    ui_menu_hide(menu);
-    ui_notify_toast(NotifyInfo, "Pulled PA power plug", 1800u);
 }
 
 static void menu_act_toggle_mode(ui_menu_t* menu, ui_menu_node_t* entry) {
@@ -1032,7 +1054,6 @@ static void menu_root_builder(ui_menu_t* menu) {
              (m->in_src == 1u) ? "Mic" : "Line");
 
     ui_menu_add(menu, UI_ACTION("Pull & Release Mics", menu_act_pull_release));
-    ui_menu_add(menu, UI_ACTION("Pull Power Plug (End)", menu_act_pull_plug));
     ui_menu_add(menu, UI_ACTION(m->mode_label, menu_act_toggle_mode));
     ui_menu_add(menu, UI_ACTION(m->bank_label, menu_act_cycle_bank));
     ui_menu_add(menu, UI_ACTION(m->target_label, menu_act_cycle_target));
@@ -1149,10 +1170,7 @@ static void draw_header(gfx_t* gfx, pm_model_t* m) {
         sw = 50;
         inv_st = true;
     } else if (m->state == ST_PLAY) {
-        if (m->dsp.plug_pulled) {
-            st_s = "UNPLUGGED";
-            sw = 62;
-        } else if (pm_all_nearly_still(&m->dsp, 2.5f)) {
+        if (pm_all_nearly_still(&m->dsp, 2.5f)) {
             st_s = "REST CHORD";
             sw = 68;
             inv_st = true;
@@ -1487,10 +1505,14 @@ static bool pm_tick(os_app_t* app) {
         m->ui_dirty = true;
     }
 
-    const bool animating = (m->state == ST_PLAY || m->state == ST_REC || m->bouncing);
-    if (m->ui_dirty || (animating && (now_ms - m->last_draw_ms >= UI_FRAME_MS))) {
+    const bool toast_win = (m->anim_until_ms != 0u) && ((int32_t)(m->anim_until_ms - now_ms) > 0);
+    const bool animating = (m->state == ST_PLAY || m->state == ST_REC ||
+                            m->bouncing || toast_win);
+    const uint32_t frame_ms = m->vol_ui ? UI_VOL_FRAME_MS : UI_FRAME_MS;
+    if ((m->ui_dirty || animating) &&
+        (m->last_draw_ms == 0u || (now_ms - m->last_draw_ms >= frame_ms))) {
         m->ui_dirty = false;
-        m->last_draw_ms = now_ms;
+        m->last_draw_ms = (now_ms != 0u) ? now_ms : 1u;
         return true;
     }
 
@@ -1533,7 +1555,7 @@ static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
                 pm_sync_monitor(m);
                 pm_sync_engine_active(m);
             } else if (m->state == ST_STOP) {
-                if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
+                if (pm_all_nearly_still(&m->dsp, 3.0f)) {
                     m->pull_req = true;
                 }
                 m->state = ST_PLAY;
@@ -1619,13 +1641,9 @@ static bool pm_app_init(os_app_t* app) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
 
     /*
-     * 1. Allocate compact 11.5 KB hot acoustic workspace FIRST so it lands in
-     *    fast internal SRAM and stays 100% resident in 16 KB L1 D-Cache.
+     * 1. `m->space` (7.5 KB) is already embedded inside `pm_model_t` in fast
+     *    internal SRAM! Allocate SD staging, DMA window pair, and menu first.
      */
-    m->space = (pend_space_t*)os_malloc(sizeof(pend_space_t));
-    if (!m->space) {
-        return false;
-    }
     m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR48 * 2u * sizeof(float));
 
     tape_t* t = tape_get();
@@ -1665,7 +1683,7 @@ static bool pm_app_init(os_app_t* app) {
 
     /* 3. Initialize 24 kHz Reich 4-pendulum coupled acoustic feedback DSP */
     pm_dsp_init(&m->dsp, (float)PM_INTERNAL_SR);
-    pm_dsp_attach_space(&m->dsp, m->space);
+    pm_dsp_attach_space(&m->dsp, &m->space);
 
     m->mode = PM_MODE_FEEDBACK;
     m->mode_mix = 0.0f;
@@ -1701,6 +1719,8 @@ static bool pm_app_init(os_app_t* app) {
     m->vol_fx.type = ParamValDBType;
     m->mic_trim = (params_t)PARAM_RANGE("mic trim", 0.40f, 0.05f, 1.50f, 0.02f);
     m->mic_trim.type = ParamValDBType;
+    m->vout_cur = 0.12f;
+    m->vfx_cur  = 0.0f;
 
     /* Tape timeline strip along bottom edge */
     m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
@@ -1763,10 +1783,6 @@ static void pm_app_deinit(os_app_t* app) {
     if (m->read_stage) {
         os_free(m->read_stage);
         m->read_stage = NULL;
-    }
-    if (m->space) {
-        os_free(m->space);
-        m->space = NULL;
     }
     if (m->slots_mem) {
         os_free(m->slots_mem);

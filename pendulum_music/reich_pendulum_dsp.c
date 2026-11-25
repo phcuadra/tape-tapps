@@ -21,8 +21,13 @@ static inline float clampf(float v, float lo, float hi) {
 #define PM_RELEASE_RAD      0.80285146f             /* 46.0 deg Reich pull-back angle */
 #define PM_BASE_CABLE_M     2.25f                   /* ~3.01 s base pendulum period */
 #define PM_H_GAP_M          0.14f                   /* 14 cm mic-to-cone clearance at nadir */
-#define PM_PHYS_SUB         32u                     /* 750 Hz symplectic Verlet rate at 24 kHz */
-#define PM_INV_PHYS_SUB     (1.0f / 32.0f)
+#define PM_PHYS_SUB         64u                     /* 375 Hz symplectic Verlet rate at 24 kHz */
+#define PM_INV_PHYS_SUB     (1.0f / 64.0f)
+
+/* Fixed gallery bay air transit delays at 24 kHz (0.80 m, 1.60 m, 2.40 m @ 343 m/s) */
+#define PM_BAY1_DELAY       56u
+#define PM_BAY2_DELAY       112u
+#define PM_BAY3_DELAY       168u
 
 /* 4 upward-facing floor speaker X coordinates along the gallery stage (meters) */
 static const float kSpkX[PM_NUM_MICS] = { -1.20f, -0.40f, +0.40f, +1.20f };
@@ -75,9 +80,9 @@ static const char* const kBankTags[PM_BANK_COUNT][PM_NUM_MICS] = {
 };
 
 /*
- * Branchless, zero-roundf minimax sin/cos on [-pi/2, +pi/2].
- * Pendulum angles are strictly bounded to +-1.0472 rad (+-60 deg) and pan
- * angles lie in [0, pi/2], so ZERO range reduction or branches are needed!
+ * Branchless minimax sin/cos on [-pi/2, +pi/2] (zero external libm calls!).
+ * Pendulum angles are strictly bounded to +-1.0472 rad (+-60 deg) and pan /
+ * filter tuning angles lie well inside [-1.57, +1.57].
  */
 static inline float sin_halfpi(float r) {
     const float r2 = r * r;
@@ -138,7 +143,7 @@ float pm_soft_limit(float x) {
 
 /*
  * Unclamped 2-point linear fractional read on interleaved `spk_ring`.
- * `delay_samp` is guaranteed in [2.0f, PM_SPK_DELAY_LEN - 6] by control-rate bounds.
+ * `delay_samp` is guaranteed in [4.0f, PM_SPK_DELAY_LEN - 8] by control-rate bounds.
  */
 static inline float linear_read_quad(const pm_quad_t* restrict ring,
                                      uint32_t wr,
@@ -229,6 +234,7 @@ static void update_synth_bank_freqs(reich_pendulum_dsp_t* d) {
         d->synth_inc[s][2] = hz_to_phase_inc(f0 * m2, inv_fs);
         d->lfo_inc[s]      = hz_to_phase_inc(kLfoHz[b][s], inv_fs);
     }
+    d->bank_dirty = false;
 }
 
 static void update_svf_voicing(reich_pendulum_dsp_t* d) {
@@ -243,18 +249,24 @@ static void update_svf_voicing(reich_pendulum_dsp_t* d) {
 
     for (uint32_t i = 0u; i < PM_NUM_MICS; ++i) {
         const float fc = kTuningFreqs[tm][i];
-        const float g = tanf(M_PI * fc * d->inv_fs);
+        /* hw = pi * fc / fs <= 0.077 rad (< 4.5 deg) -> sin_halfpi/cos_halfpi exact to 1e-7 */
+        const float hw = clampf(M_PI * fc * d->inv_fs, 0.002f, 0.45f);
+        const float g = sin_halfpi(hw) / cos_halfpi(hw);
         const float a1 = 1.0f / (1.0f + g * (g + k_voice));
 
         d->tau_trim[i] = clampf(tau0, 4.0f, 32.0f);
 
-        /* Exact Barkhausen closed-loop unity-gain threshold calibration at fc */
-        const float w = PM_TWO_PI * fc * d->inv_fs;
-        const float re_d = 1.0f - lp_b * cosf(w);
-        const float im_d = lp_b * sinf(w);
+        /* Exact Barkhausen closed-loop unity-gain threshold calibration at fc (zero libm imports) */
+        const float w = clampf(2.0f * hw, 0.004f, 0.90f);
+        const float cw = cos_halfpi(w);
+        const float sw = sin_halfpi(w);
+        const float re_d = 1.0f - lp_b * cw;
+        const float im_d = lp_b * sw;
         const float mag_lp = lp_a / sqrtf(re_d * re_d + im_d * im_d);
-        const float phi_lag = w * d->tau_trim[i] + atan2f(im_d, re_d);
-        const float cos_lag = fmaxf(0.42f, cosf(clampf(phi_lag, -1.15f, 1.15f)));
+        const float ratio = im_d / fmaxf(0.05f, re_d);
+        const float atan_apx = ratio / (1.0f + 0.28125f * ratio * ratio);
+        const float phi_lag = clampf(w * d->tau_trim[i] + atan_apx, -1.15f, 1.15f);
+        const float cos_lag = fmaxf(0.42f, cos_halfpi(phi_lag));
 
         d->svf_g[i]      = g;
         d->svf_k_gain[i] = k_voice / fmaxf(0.30f, mag_lp * cos_lag);
@@ -262,19 +274,19 @@ static void update_svf_voicing(reich_pendulum_dsp_t* d) {
         d->svf_a2[i]     = g * a1;
         d->svf_a3[i]     = g * g * a1;
     }
+    d->voicing_dirty = false;
 }
 
 /*
- * Recompute 3D capsule positions, self/cross propagation delays, sparse active
- * cross-bleed tap list, Mode 2 pan gains, and phase coherence (at 750 Hz).
+ * Recompute 3D capsule positions, self propagation delays, smooth gallery air
+ * coupling gains, Mode 2 pan gains, and inter-mic phase coherence (at 375 Hz,
+ * exclusively on the audio thread or during single-threaded init/reset).
  */
 static void update_acoustic_matrix(reich_pendulum_dsp_t* d, bool snap) {
     const float samp_per_m = d->sample_rate * (1.0f / PM_SOUND_SPEED);
-    const float pa_base = (0.88f + 1.95f * clampf(d->gain_norm, 0.0f, 1.0f)) * d->pa_power;
+    const float pa_base = 0.88f + 1.95f * clampf(d->gain_norm, 0.0f, 1.0f);
     const float cpl_amt = clampf(d->couple_norm, 0.0f, 1.0f);
-    const float max_self_del  = (float)(PM_SPK_DELAY_LEN - 8u);
-    const float max_cross_del = (float)(PM_SPK_DELAY_LEN - 6u);
-    const float cross_base_del = 8.0f * (d->sample_rate * (1.0f / 24000.0f));
+    const float max_self_del = (float)(PM_SPK_DELAY_LEN - 8u);
 
     float g_self[PM_NUM_MICS];
     float r_amp[PM_NUM_MICS];
@@ -317,20 +329,17 @@ static void update_acoustic_matrix(reich_pendulum_dsp_t* d, bool snap) {
 
     float sync_num = 0.0f;
     float sync_den = 0.0f;
-    uint8_t tap_cnt = 0u;
-    const bool do_cross = (d->space != NULL) && (cpl_amt > 0.002f);
+    static const float kDistWeight[4] = { 0.0f, 0.56f, 0.36f, 0.26f };
 
     for (uint32_t i = 0u; i < PM_NUM_MICS; ++i) {
         float interf_sum = 0.0f;
 
-        if (cpl_amt > 0.002f) {
+        if (cpl_amt > 0.001f) {
             for (uint32_t j = 0u; j < PM_NUM_MICS; ++j) {
                 if (j == i) continue;
 
-                const float dx = d->px[i] - kSpkX[j];
-                const float dz = d->pz[i];
-                const float dist = sqrtf(dx * dx + dz * dz);
-                const float cdel_tgt = clampf(cross_base_del + dist * samp_per_m, 2.0f, max_cross_del);
+                const uint32_t bay_diff = (i > j) ? (i - j) : (j - i);
+                const float dist_w = kDistWeight[bay_diff & 3u];
 
                 const float prod_r = r_amp[i] * r_amp[j];
                 const float act = clampf(prod_r * 14.0f, 0.0f, 1.0f);
@@ -339,14 +348,8 @@ static void update_acoustic_matrix(reich_pendulum_dsp_t* d, bool snap) {
                                       (prod_r + 1.0e-5f);
                 const float coh = act * clampf(raw_cos, -1.0f, 1.0f) + (1.0f - act) * 0.24f;
 
-                const float excess_d = fmaxf(0.0f, dist - 0.75f);
-                const float dist_w = 1.0f / (1.0f + 0.95f * excess_d);
-
-                const float c_gain = cpl_amt * 0.30f * dist_w *
-                                     (0.16f + 0.84f * g_self[i]) * coh;
-
                 const float pair_act = g_self[i] * g_self[j] * dist_w;
-                interf_sum += cpl_amt * 0.36f * pair_act * coh;
+                interf_sum += cpl_amt * 0.42f * pair_act * coh;
 
                 if (j == i + 1u) {
                     d->pair_coh[i] = coh * cpl_amt;
@@ -356,54 +359,44 @@ static void update_acoustic_matrix(reich_pendulum_dsp_t* d, bool snap) {
                     sync_num += coh * w_pair;
                     sync_den += w_pair;
                 }
-
-                if (snap || d->cross_del_cur[i][j] < 2.0f) {
-                    d->cross_del_cur[i][j] = cdel_tgt;
-                }
-                const float cur_cd = d->cross_del_cur[i][j];
-                const float inc_cd = (cdel_tgt - cur_cd) * PM_INV_PHYS_SUB;
-                d->cross_del_cur[i][j] = cdel_tgt;
-
-                if (do_cross && fabsf(c_gain) > 3.5e-3f && tap_cnt < 12u) {
-                    d->cross_taps[tap_cnt].mic_dst = (uint8_t)i;
-                    d->cross_taps[tap_cnt].spk_src = (uint8_t)j;
-                    d->cross_taps[tap_cnt].gain    = c_gain;
-                    d->cross_taps[tap_cnt].del_cur = cur_cd;
-                    d->cross_taps[tap_cnt].del_inc = inc_cd;
-                    tap_cnt++;
-                }
             }
         } else if (i < 3u) {
             d->pair_coh[i] = 0.0f;
         }
 
+        /* Continuous smooth gallery cross-pickup & loop gain targets (zero threshold steps!) */
+        d->cross_gain_tgt[i] = cpl_amt * 0.24f * (0.20f + 0.80f * g_self[i]);
         const float mod = clampf(1.0f + interf_sum, 0.62f, 1.52f);
         d->loop_gain_tgt[i] = pa_base * mod;
 
         if (snap || d->self_del_cur[i] < 4.0f) {
-            d->self_del_cur[i]  = d->self_del_tgt[i];
-            d->self_gain_cur[i] = d->self_gain_tgt[i];
-            d->loop_gain_cur[i] = d->loop_gain_tgt[i];
-            d->self_del_inc[i]  = 0.0f;
-            d->self_gain_inc[i] = 0.0f;
-            d->loop_gain_inc[i] = 0.0f;
+            d->self_del_cur[i]   = d->self_del_tgt[i];
+            d->self_gain_cur[i]  = d->self_gain_tgt[i];
+            d->cross_gain_cur[i] = d->cross_gain_tgt[i];
+            d->loop_gain_cur[i]  = d->loop_gain_tgt[i];
+            d->self_del_inc[i]   = 0.0f;
+            d->self_gain_inc[i]  = 0.0f;
+            d->cross_gain_inc[i] = 0.0f;
+            d->loop_gain_inc[i]  = 0.0f;
         } else {
-            d->self_del_inc[i]  = (d->self_del_tgt[i]  - d->self_del_cur[i])  * PM_INV_PHYS_SUB;
-            d->self_gain_inc[i] = (d->self_gain_tgt[i] - d->self_gain_cur[i]) * PM_INV_PHYS_SUB;
-            d->loop_gain_inc[i] = (d->loop_gain_tgt[i] - d->loop_gain_cur[i]) * PM_INV_PHYS_SUB;
+            d->self_del_inc[i]   = (d->self_del_tgt[i]   - d->self_del_cur[i])   * PM_INV_PHYS_SUB;
+            d->self_gain_inc[i]  = (d->self_gain_tgt[i]  - d->self_gain_cur[i])  * PM_INV_PHYS_SUB;
+            d->cross_gain_inc[i] = (d->cross_gain_tgt[i] - d->cross_gain_cur[i]) * PM_INV_PHYS_SUB;
+            d->loop_gain_inc[i]  = (d->loop_gain_tgt[i]  - d->loop_gain_cur[i])  * PM_INV_PHYS_SUB;
         }
     }
-
-    d->num_cross_taps = tap_cnt;
 
     const float target_sync = (sync_den > 1.0e-4f)
                                   ? clampf((sync_num / sync_den) * cpl_amt, -1.0f, 1.0f)
                                   : 0.0f;
-    d->phase_sync += 0.18f * (target_sync - d->phase_sync);
+    d->phase_sync += 0.22f * (target_sync - d->phase_sync);
 }
 
 static void step_pendulums_verlet(reich_pendulum_dsp_t* d, float dt) {
     if (dt <= 0.0f || dt > 0.05f) return;
+
+    /* Refresh cable length targets on the audio thread from volatile `spread_norm` */
+    update_cable_targets(d, false);
 
     const float dec = clampf(d->decay_norm, 0.0f, 1.0f);
     const float gamma = (dec < 0.005f) ? 0.0f : (dec * dec * 0.44f + dec * 0.055f);
@@ -446,17 +439,16 @@ void pm_dsp_init(reich_pendulum_dsp_t* d, float sample_rate) {
     d->dc_r = clampf(1.0f - (PM_TWO_PI * 18.0f * d->inv_fs), 0.990f, 0.9995f);
     d->rng_state = 0x19685245u;
 
-    d->gain_norm    = 0.58f;
-    d->couple_norm  = 0.50f;
-    d->spread_norm  = 0.42f;
-    d->decay_norm   = 0.35f;
-    d->tuning_mode  = PM_TUNING_FIFTHS;
-    d->bank_idx     = PM_BANK_ORGANS;
+    d->gain_norm       = 0.58f;
+    d->couple_norm     = 0.50f;
+    d->spread_norm     = 0.42f;
+    d->decay_norm      = 0.35f;
+    d->tuning_mode     = PM_TUNING_FIFTHS;
+    d->bank_idx        = PM_BANK_ORGANS;
     d->release_stagger = false;
-    d->plug_pulled  = false;
-    d->pa_power     = 1.0f;
-    d->pa_power_tgt = 1.0f;
-    d->phys_rem     = 0u;
+    d->voicing_dirty   = false;
+    d->bank_dirty      = false;
+    d->phys_rem        = 0u;
 
     for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
         d->synth_ph[s][0] = s * 0x29000000u;
@@ -504,22 +496,20 @@ void pm_dsp_clear_audio(reich_pendulum_dsp_t* d) {
     update_acoustic_matrix(d, true);
 }
 
+/* Lock-free UI setters: write volatile targets only; audio thread applies smoothly */
 void pm_set_gain(reich_pendulum_dsp_t* d, float norm) {
     if (!d) return;
     d->gain_norm = clampf(norm, 0.0f, 1.0f);
-    update_acoustic_matrix(d, false);
 }
 
 void pm_set_couple(reich_pendulum_dsp_t* d, float norm) {
     if (!d) return;
     d->couple_norm = clampf(norm, 0.0f, 1.0f);
-    update_acoustic_matrix(d, false);
 }
 
 void pm_set_spread(reich_pendulum_dsp_t* d, float norm) {
     if (!d) return;
     d->spread_norm = clampf(norm, 0.0f, 1.0f);
-    update_cable_targets(d, false);
 }
 
 void pm_set_decay(reich_pendulum_dsp_t* d, float norm) {
@@ -530,14 +520,13 @@ void pm_set_decay(reich_pendulum_dsp_t* d, float norm) {
 void pm_set_tuning(reich_pendulum_dsp_t* d, uint8_t tuning_mode) {
     if (!d) return;
     d->tuning_mode = tuning_mode % PM_TUNING_COUNT;
-    update_svf_voicing(d);
-    update_acoustic_matrix(d, false);
+    d->voicing_dirty = true;
 }
 
 void pm_set_bank(reich_pendulum_dsp_t* d, uint8_t bank_idx) {
     if (!d) return;
     d->bank_idx = bank_idx % PM_BANK_COUNT;
-    update_synth_bank_freqs(d);
+    d->bank_dirty = true;
 }
 
 void pm_set_release_stagger(reich_pendulum_dsp_t* d, bool stagger) {
@@ -547,10 +536,6 @@ void pm_set_release_stagger(reich_pendulum_dsp_t* d, bool stagger) {
 
 void pm_pull_and_release(reich_pendulum_dsp_t* d) {
     if (!d) return;
-    d->plug_pulled = false;
-    d->pa_power_tgt = 1.0f;
-    if (d->pa_power < 0.15f) d->pa_power = 0.15f;
-
     update_cable_targets(d, true);
 
     if (!d->release_stagger) {
@@ -577,12 +562,6 @@ void pm_set_pendulum_state(reich_pendulum_dsp_t* d, uint32_t idx, float theta_ra
     d->omega[idx] = clampf(omega_rad_s, -12.0f, 12.0f);
     d->phys_rem = PM_PHYS_SUB;
     update_acoustic_matrix(d, true);
-}
-
-void pm_pull_plug(reich_pendulum_dsp_t* d) {
-    if (!d) return;
-    d->plug_pulled = true;
-    d->pa_power_tgt = 0.0f;
 }
 
 bool pm_all_nearly_still(const reich_pendulum_dsp_t* d, float deg_thresh) {
@@ -653,8 +632,8 @@ static inline pm_frame_t synth_voice_sample(const reich_pendulum_dsp_t* d, uint3
 
 /*
  * Fast block-fused 24 kHz renderer: processes `frames24` stereo frames into
- * interleaved `out24[0 .. 2*frames24 - 1]` with zero per-sample function calls,
- * zero denormal-check pipeline stalls, and cache-contiguous interleaved delays.
+ * interleaved `out24[0 .. 2*frames24 - 1]` with zero UI/audio races, zero
+ * discontinuous tap steps, and internal-SRAM delay access.
  */
 void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
                            float* restrict out24,
@@ -671,6 +650,13 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
                            uint8_t custom_mask) {
     if (!d || !out24 || frames24 == 0u) return;
 
+    if (d->voicing_dirty) {
+        update_svf_voicing(d);
+    }
+    if (d->bank_dirty) {
+        update_synth_bank_freqs(d);
+    }
+
     float pg = *io_play_gain;
     float mm = *io_mode_mix;
 
@@ -679,8 +665,6 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
     const float env_atk    = 0.0084f * rate_scale;
     const float env_rel    = 0.00104f * rate_scale;
     const float vca_slew   = 0.0064f * rate_scale;
-    const float pwr_up     = 0.0050f * rate_scale;
-    const float pwr_dn     = 0.00015f * rate_scale;
     const float dc_r       = d->dc_r;
 
     pend_space_t* restrict sp = d->space;
@@ -720,8 +704,6 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
         d->phys_rem = (uint8_t)(d->phys_rem - chunk);
         rem -= chunk;
 
-        const uint8_t n_taps = sp ? d->num_cross_taps : 0u;
-        const float pwr_slew = (d->pa_power_tgt > d->pa_power) ? pwr_up : pwr_dn;
         bool skipped_vca_all = true;
 
         for (uint32_t n = 0u; n < chunk; ++n) {
@@ -741,18 +723,16 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
                 if (mm < mode_target) mm = mode_target;
             }
 
-            d->pa_power += pwr_slew * (d->pa_power_tgt - d->pa_power);
-            if (d->pa_power < 1.0e-5f) d->pa_power = 0.0f;
-            const float pa_pwr = d->pa_power;
-
-            /* 1. Sparse active cross-speaker air coupling */
-            float cross_in[PM_NUM_MICS] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            for (uint32_t t = 0u; t < n_taps; ++t) {
-                pm_cross_tap_t* restrict ct = &d->cross_taps[t];
-                const float cd = ct->del_cur;
-                ct->del_cur = cd + ct->del_inc;
-                cross_in[ct->mic_dst] += ct->gain *
-                    linear_read_quad(sp->spk_ring, wr, ct->spk_src, cd);
+            /* 1. Continuous 3-load gallery speaker cross-air field (zero tap-step clicks!) */
+            float air_cross[PM_NUM_MICS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            if (sp) {
+                const pm_quad_t q1 = sp->spk_ring[(wr - PM_BAY1_DELAY) & PM_SPK_DELAY_MASK];
+                const pm_quad_t q2 = sp->spk_ring[(wr - PM_BAY2_DELAY) & PM_SPK_DELAY_MASK];
+                const pm_quad_t q3 = sp->spk_ring[(wr - PM_BAY3_DELAY) & PM_SPK_DELAY_MASK];
+                air_cross[0] = 0.54f * q1.ch[1] + 0.28f * q2.ch[2] + 0.16f * q3.ch[3];
+                air_cross[1] = 0.48f * (q1.ch[0] + q1.ch[2]) + 0.26f * q2.ch[3];
+                air_cross[2] = 0.48f * (q1.ch[1] + q1.ch[3]) + 0.26f * q2.ch[0];
+                air_cross[3] = 0.54f * q1.ch[2] + 0.28f * q2.ch[1] + 0.16f * q3.ch[0];
             }
 
             const float room_air = next_noise_bi(&rng) * 0.00042f + 1.0e-20f;
@@ -762,19 +742,21 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
 
             /* 2. 4 swinging microphone -> speaker PA resonant feedback channels */
             for (uint32_t i = 0u; i < PM_NUM_MICS; ++i) {
-                const float sg = d->self_gain_cur[i] + d->self_gain_inc[i];
-                const float lg = d->loop_gain_cur[i] + d->loop_gain_inc[i];
-                const float sd = d->self_del_cur[i]  + d->self_del_inc[i];
-                d->self_gain_cur[i] = sg;
-                d->loop_gain_cur[i] = lg;
-                d->self_del_cur[i]  = sd;
+                const float sg = d->self_gain_cur[i]  + d->self_gain_inc[i];
+                const float cg = d->cross_gain_cur[i] + d->cross_gain_inc[i];
+                const float lg = d->loop_gain_cur[i]  + d->loop_gain_inc[i];
+                const float sd = d->self_del_cur[i]   + d->self_del_inc[i];
+                d->self_gain_cur[i]  = sg;
+                d->cross_gain_cur[i] = cg;
+                d->loop_gain_cur[i]  = lg;
+                d->self_del_cur[i]   = sd;
 
                 const float w_self = sp ? linear_read_quad(sp->spk_ring, wr, i, sd)
                                         : d->last_spk[i];
 
                 const float self_nz = next_noise_bi(&rng) * 0.00026f;
-                const float air_seed = (room_air + self_nz + 0.00014f * d->omega[i]) * pa_pwr;
-                const float mic_in = sg * w_self + cross_in[i] + air_seed;
+                const float air_seed = room_air + self_nz + 0.00014f * d->omega[i];
+                const float mic_in = sg * w_self + cg * air_cross[i] + air_seed;
 
                 /* Paper-cone 1-pole cabinet rolloff + Cytomic ZDF bandpass SVF (zero DC gain) */
                 const float lpy = d->lp_y[i] + lp_a * (mic_in - d->lp_y[i]);
@@ -789,7 +771,7 @@ void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
                 d->svf_ic2[i] = 2.0f * v2 - ic2;
 
                 const float pre = (d->svf_k_gain[i] * v1) * lg;
-                const float spk_y = pa_pwr * fast_pa_sat(pre);
+                const float spk_y = fast_pa_sat(pre);
                 next_q.ch[i] = spk_y;
                 d->last_spk[i] = spk_y;
 

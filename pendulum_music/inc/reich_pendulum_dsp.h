@@ -7,29 +7,29 @@
 /*
  * reich_pendulum_dsp.h — Steve Reich 1968 "Pendulum Music" Coupled Feedback Engine
  *
- * Ultra-lightweight, SRAM/L1-cache-resident 24 kHz internal float32 simulation
- * (upsampled to 48 kHz via firmware `ups2x_f32_add`) of 4 suspended microphones
- * (i = 0..3) swinging on staggered overhead cables above 4 upward-facing floor
- * speakers (j = 0..3) in a shared gallery space:
- *   1. Symplectic Velocity-Verlet nonlinear pendulum kinematics (750 Hz control
- *      sub-rate, every 32 samples at 24 kHz):
+ * Ultra-lightweight, internal-SRAM-resident 24 kHz float32 simulation (upsampled
+ * to 48 kHz via firmware `ups2x_f32_add`) of 4 suspended microphones (i = 0..3)
+ * swinging on staggered overhead cables above 4 upward-facing floor speakers
+ * (j = 0..3) in a shared gallery space:
+ *   1. Symplectic Velocity-Verlet nonlinear pendulum kinematics (375 Hz control
+ *      sub-rate, every 64 samples at 24 kHz):
  *        d2_theta_i/dt^2 = -(g / L_i) * sin(theta_i) - gamma * d_theta_i/dt
- *      capturing amplitude-dependent period dispersion, cable-length phasing (SPREAD),
- *      perpetual vs gradual decay into a resting 4-voice feedback chord (DECAY),
- *      Unison/Staggered Pull & Release, and the 1968 "Pull Power Plug" ending.
- *   2. Frame-interleaved 4x4 speaker-to-microphone 3D Euclidean acoustic propagation
- *      matrix (`pm_quad_t spk_ring[512]`, 8 KB total — zero 4 KB L1 D-Cache way
- *      aliasing!), with 4-point Hermite cubic self-paths and linear cross-bleed paths.
- *   3. Single-pass block renderer (`pm_dsp_render_block24`) fusing Mode 1 ("1:FEEDBACK")
- *      and Mode 2 ("2:SOUND VCA") in registers with zero per-sample cross-TU calls,
- *      zero denormal-check pipeline stalls, and zero audio-rate libm calls.
+ *      capturing amplitude-dependent period dispersion, cable-length phasing
+ *      (SPREAD), perpetual vs gradual decay into a resting 4-voice feedback
+ *      chord (DECAY), and Unison/Staggered Pull & Release.
+ *   2. Frame-interleaved speaker delay ring (`pm_quad_t spk_ring[256]`, 4 KB in
+ *      internal SRAM) with smooth per-sample-interpolated self-Doppler paths and
+ *      continuous 3-tap gallery speaker air cross-coupling (zero tap-switching clicks).
+ *   3. Lock-free parameter handoff & single-pass block renderer (`pm_dsp_render_block24`)
+ *      fusing Mode 1 ("1:FEEDBACK") and Mode 2 ("2:SOUND VCA") with zero UI/audio
+ *      thread races and zero audio-rate libm calls.
  */
 
 #define PM_NUM_MICS        4u
 #define PM_INTERNAL_SR     24000u
 
-/* 24 kHz delay lengths (21.3 ms speaker air path = >7.3 m; 10.7 ms gallery room) */
-#define PM_SPK_DELAY_LEN   512u
+/* 24 kHz delay lengths (10.7 ms speaker air path = 3.66 m; 10.7 ms gallery room) */
+#define PM_SPK_DELAY_LEN   256u
 #define PM_SPK_DELAY_MASK  (PM_SPK_DELAY_LEN - 1u)
 
 #define PM_ROOM_LEN        256u
@@ -38,7 +38,7 @@
 #define PM_AP_LEN          64u
 #define PM_AP_MASK         (PM_AP_LEN - 1u)
 
-/* Max interleaved float32 samples per 24 kHz render chunk (128 stereo 24k frames = 256 stereo 48k frames) */
+/* Max interleaved float32 samples per 24 kHz render chunk (128 stereo 24k frames) */
 #define PM_SCRATCH24       256u
 
 typedef struct {
@@ -46,7 +46,7 @@ typedef struct {
     float r;
 } pm_frame_t;
 
-/* 16-byte frame-interleaved speaker quad: all 4 speakers share a single 32-byte L1 cache line */
+/* 16-byte frame-interleaved speaker quad: all 4 speakers share a single cache line */
 typedef struct {
     float ch[PM_NUM_MICS];
 } pm_quad_t;
@@ -67,11 +67,11 @@ enum {
 };
 
 /*
- * Compact 11.5 KB SRAM/L1-cache-resident acoustic workspace (11,776 bytes total).
- * Fits comfortably inside STM32H7 16 KB L1 D-Cache with zero set-conflict thrashing.
+ * Compact 7.5 KB (7,680-byte) hot acoustic workspace embedded directly inside
+ * `pm_model_t` so the firmware places it in zero-wait-state internal SRAM.
  */
 typedef struct {
-    pm_quad_t spk_ring[PM_SPK_DELAY_LEN];   /* 512 * 16 B = 8,192 B (8.0 KB) */
+    pm_quad_t spk_ring[PM_SPK_DELAY_LEN];   /* 256 * 16 B = 4,096 B (4.0 KB) */
     float     room_l[PM_ROOM_LEN];          /* 256 *  4 B = 1,024 B (1.0 KB) */
     float     room_r[PM_ROOM_LEN];          /* 256 *  4 B = 1,024 B (1.0 KB) */
     float     ap_l[PM_AP_LEN];              /*  64 *  4 B =   256 B          */
@@ -79,34 +79,22 @@ typedef struct {
     float     scratch24[PM_SCRATCH24];      /* 256 *  4 B = 1,024 B (1.0 KB) */
 } pend_space_t;
 
-/* Compact active cross-speaker coupling tap prepared at 750 Hz control rate */
-typedef struct {
-    uint8_t mic_dst;
-    uint8_t spk_src;
-    float   gain;
-    float   del_cur;
-    float   del_inc;
-} pm_cross_tap_t;
-
 typedef struct {
     float sample_rate;
     float inv_fs;
 
-    /* Normalized performance controls [0..1] */
-    float gain_norm;
-    float couple_norm;
-    float spread_norm;
-    float decay_norm;
+    /* Lock-free normalized performance controls [0..1] written by UI, read by audio */
+    volatile float   gain_norm;
+    volatile float   couple_norm;
+    volatile float   spread_norm;
+    volatile float   decay_norm;
+    volatile uint8_t tuning_mode;
+    volatile uint8_t bank_idx;
+    volatile bool    release_stagger;
+    volatile bool    voicing_dirty;
+    volatile bool    bank_dirty;
 
-    uint8_t tuning_mode;
-    uint8_t bank_idx;
-    bool    release_stagger;
-    bool    plug_pulled;
     uint8_t phys_rem;
-
-    /* PA power supply rail [0..1] */
-    float pa_power;
-    float pa_power_tgt;
 
     /* Per-pendulum nonlinear kinematics & cached reciprocals */
     float theta[PM_NUM_MICS];
@@ -121,11 +109,11 @@ typedef struct {
     float norm_u[PM_NUM_MICS];
     float norm_v[PM_NUM_MICS];
 
-    /* Precomputed Mode 2 constant-power stereo pan gains (updated at 750 Hz) */
+    /* Precomputed Mode 2 constant-power stereo pan gains (updated at 375 Hz) */
     float vca_pan_l[PM_NUM_MICS];
     float vca_pan_r[PM_NUM_MICS];
 
-    /* Self-path delays & gains with precomputed linear sub-block increments */
+    /* Continuous per-sample-ramped delays & gains (zero staircase jumps) */
     float self_del_cur[PM_NUM_MICS];
     float self_del_tgt[PM_NUM_MICS];
     float self_del_inc[PM_NUM_MICS];
@@ -134,14 +122,13 @@ typedef struct {
     float self_gain_tgt[PM_NUM_MICS];
     float self_gain_inc[PM_NUM_MICS];
 
+    float cross_gain_cur[PM_NUM_MICS];
+    float cross_gain_tgt[PM_NUM_MICS];
+    float cross_gain_inc[PM_NUM_MICS];
+
     float loop_gain_cur[PM_NUM_MICS];
     float loop_gain_tgt[PM_NUM_MICS];
     float loop_gain_inc[PM_NUM_MICS];
-
-    /* Cross-speaker propagation delays & active sparse tap list (<= 12 pairs) */
-    float          cross_del_cur[PM_NUM_MICS][PM_NUM_MICS];
-    pm_cross_tap_t cross_taps[12];
-    uint8_t        num_cross_taps;
 
     /* Per-channel PA cabinet LPF + resonant ZDF Bandpass SVF (zero DC gain) */
     float lp_y[PM_NUM_MICS];
@@ -201,7 +188,6 @@ void pm_set_release_stagger(reich_pendulum_dsp_t* d, bool stagger);
 
 void pm_pull_and_release(reich_pendulum_dsp_t* d);
 void pm_set_pendulum_state(reich_pendulum_dsp_t* d, uint32_t idx, float theta_rad, float omega_rad_s);
-void pm_pull_plug(reich_pendulum_dsp_t* d);
 bool pm_all_nearly_still(const reich_pendulum_dsp_t* d, float deg_thresh);
 
 const char* pm_tuning_name(uint8_t tuning_mode);
