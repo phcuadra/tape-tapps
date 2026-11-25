@@ -23,7 +23,7 @@ A standalone *tape!* application (`AppTypeStandalone`) modeled after Steve Reich
 | Control | Action |
 |---|---|
 | **BTN1 Press** | Play / Stop reels |
-| **BTN1 Hold** | Volume overlay (`out`, `fx send`, `in`, `mic trim`) |
+| **BTN1 Hold** | Volume overlay (`out` @ `25%` default, `fx send`, `in`, `mic trim`) |
 | **BTN2 Press** | Capture live input into RAM loop (live input is monitored **only** while recording) / Close loop & start Lap 1 in `0.0°` Unison |
 | **BTN2 Hold** | Bounce live phasing output to free SD tape space (Start / Stop & commit) |
 | **BTN3 Press** | Toggle Phase Drift (`phase` / `PHASING`) ↔ Capstan Thumb-Lock (`lock` / `LOCKED` at `0.000%` slip) |
