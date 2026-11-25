@@ -5,8 +5,8 @@
  * Microphones, Amplifiers, Speakers and Performers".
  *
  * Simulates 4 suspended microphones (M1..M4) swinging on overhead cables
- * above 4 upward-facing floor speakers in a shared gallery space with a full
- * 4x4 3D Hermite fractional-delay acoustic propagation matrix, inter-mic
+ * above 4 upward-facing floor speakers in a shared gallery space with a
+ * frame-interleaved 4x4 3D acoustic propagation matrix, inter-mic
  * constructive/destructive phase interference, Barkhausen/Doppler pitch glides,
  * gradual decay into a continuous 4-voice resting feedback chord, and the
  * iconic "Pull Power Plug" ending.
@@ -21,7 +21,7 @@
  *
  * Controls:
  *   BTN1 press : Play / Stop (auto-pulls & releases mics if still or unplugged)
- *   BTN1 hold  : Volume overlay (out / fx send / in / mic trim)
+ *   BTN1 hold  : Volume overlay (out @ 25% default / fx send / in / mic trim)
  *   BTN2 press : Record live input into target pendulum slot M1..M4 (REC-only monitor)
  *   BTN2 hold  : Bounce stereo gallery output to free SD tape space (DMA windows)
  *   BTN3 press : Toggle Mode 1 (fbk: 1:FEEDBACK) <-> Mode 2 (vca: 2:SOUND VCA)
@@ -43,22 +43,27 @@ TAPP_DECLARE_TYPE(AppTypeStandalone);
 /* ----------------------------------------------------------------------------
  * Constants & Configuration
  * ------------------------------------------------------------------------- */
-#define FRAMES_PER_POS   64u
-#define WIN_NONE         0xFFFFFFFFu
-#define MIN_LOOP_FR      (TAPP_SAMPLE_RATE / 5u)    /* 0.2 s minimum slot loop */
-#define SPLICE_FADE_FR       960u                   /* 20 ms smoothstep loop splice */
-#define REC_FADE_IN_FR       1200u                  /* 25 ms smoothstep capture fade-in */
-#define MIC_START_SETTLE_FR  4080u                  /* 85 ms post-BTN2-release settle */
-#define MIC_BTN_HELD_MAX_FR  12000u                 /* 250 ms max holdoff while BTN2 down */
-#define MIC_STOP_TRIM_FR     5280u                  /* 110 ms stop-button click tail trim */
-#define BOUNCE_FADE_FR       1440u                  /* 30 ms bounce fade in/out */
-#define MIN_BOUNCE_FR        (2u * TAPP_SAMPLE_RATE)/* require >= 2 s free tape */
-#define BOUNCE_GUARD_FR      (128u * FRAMES_PER_POS)
-#define COMMIT_TRIM_POS      64u
-#define LOAD_CHUNK_FR        2048u                  /* ~42 ms per tick during tape_read */
+#define FRAMES_PER_POS        64u
+#define WIN_NONE              0xFFFFFFFFu
 
-#define TRAIL_LEN        3u
-#define MAX_MENU_TAKES   20u
+/* Custom slot audio runs at PM_INTERNAL_SR (24 kHz), matching the DSP engine */
+#define MIN_LOOP_FR24         (PM_INTERNAL_SR / 5u)     /* 0.2 s minimum slot loop */
+#define SPLICE_FADE_FR24      480u                      /* 20 ms smoothstep loop splice */
+#define REC_FADE_IN_FR24      600u                      /* 25 ms smoothstep capture fade-in */
+#define MIC_START_SETTLE_FR24 2040u                     /* 85 ms post-BTN2-release settle */
+#define MIC_BTN_HELD_MAX_FR24 6000u                     /* 250 ms max holdoff while BTN2 down */
+#define MIC_STOP_TRIM_FR24    2640u                     /* 110 ms stop-button click tail trim */
+
+/* 48 kHz Tape I/O constants */
+#define BOUNCE_FADE_FR        1440u                     /* 30 ms bounce fade in/out */
+#define MIN_BOUNCE_FR         (2u * TAPP_SAMPLE_RATE)   /* require >= 2 s free tape */
+#define BOUNCE_GUARD_FR       (128u * FRAMES_PER_POS)
+#define COMMIT_TRIM_POS       64u
+#define LOAD_CHUNK_FR48       2048u                     /* ~42 ms per tick during tape_read */
+
+#define UI_FRAME_MS           33u                       /* 30 fps smooth frame-paced UI */
+#define TRAIL_LEN             2u
+#define MAX_MENU_TAKES        20u
 
 enum {
     ST_STOP = 0,
@@ -81,7 +86,7 @@ enum {
 };
 
 /* ----------------------------------------------------------------------------
- * App Model (< 3.2 KB in internal SRAM; audio loops & delay space in PSRAM)
+ * App Model (~2.8 KB in internal SRAM; audio loops in PSRAM, 11.5 KB space in SRAM)
  * ------------------------------------------------------------------------- */
 typedef struct {
     /* Transport & cross-thread request flags */
@@ -89,27 +94,31 @@ typedef struct {
     volatile uint8_t  mode;             /* PM_MODE_FEEDBACK or PM_MODE_SOUND_VCA */
     volatile bool     buf_locked;
     volatile bool     rec_done_req;
+    volatile bool     mon_arm_req;      /* set by audio when post-BTN2 holdoff finishes */
     volatile bool     tape_swapped;
     volatile bool     pull_req;
     volatile bool     plug_req;
     volatile bool     seed_req;
     volatile bool     eng_active;
 
-    /* PSRAM workspace: 4 stereo sound slots + 4x4 acoustic delay space + staging */
+    /* Workspace: 11.5 KB hot delay space + 4 stereo 24 kHz sound slots + staging */
+    pend_space_t*     space;
     pm_frame_t*       slots_mem;
     pm_frame_t*       slot_buf[PM_NUM_MICS];
-    pend_space_t*     space;
     float*            read_stage;
-    uint32_t          max_slot_frames;
+    uint32_t          max_slot_frames;  /* in 24 kHz stereo frames */
     volatile uint32_t slot_len[PM_NUM_MICS];
     volatile uint32_t head_i[PM_NUM_MICS];
+
+    /* 24 kHz -> 48 kHz firmware upsampler state */
+    ups2x_f32_t       ups;
 
     /* Slot metadata, recording target & button-click pop suppression state */
     uint8_t           rec_slot;         /* Active target slot 0..3 (M1..M4) */
     uint8_t           bank_idx;         /* Active built-in bank 0..3 */
     volatile uint8_t  slot_custom;      /* Bitmask (bits 0..3): 1 = custom USER/TK audio */
     char              slot_tag[PM_NUM_MICS][6];
-    volatile uint32_t rec_frames;
+    volatile uint32_t rec_frames;       /* captured 24 kHz frames */
     volatile bool     rec_btn_down;
     volatile bool     rec_manual_stop;
     volatile uint32_t rec_holdoff_fr;
@@ -123,20 +132,21 @@ typedef struct {
     float             play_gain;
     float             mode_mix;         /* 0.0 = Mode 1 Feedback, 1.0 = Mode 2 VCA */
 
-    /* Core 4-pendulum coupled acoustic feedback DSP engine */
+    /* Core 4-pendulum coupled acoustic feedback DSP engine (runs at 24 kHz) */
     reich_pendulum_dsp_t dsp;
 
-    /* Chunked SD tape-take loader (single slot or sequential M1..M4) */
-    uint32_t          load_src_frame;
-    uint32_t          load_total;
-    uint32_t          load_done;
+    /* Chunked SD tape-take loader (48 kHz tape -> 24 kHz slot) */
+    uint32_t          load_src_frame48;
+    uint32_t          load_total48;
+    uint32_t          load_done48;
+    uint32_t          load_written24;
     uint8_t           load_dst_slot;
     uint8_t           load_batch_idx;
     uint8_t           load_batch_cnt;
     bool              load_batch_mode;
     uint32_t          load_take_idx;
 
-    /* Bounce-to-tape DMA streaming state */
+    /* Bounce-to-tape DMA streaming state (48 kHz) */
     tape_buffer_t*    wb;
     volatile bool     bouncing;
     volatile bool     bounce_stop_req;
@@ -147,11 +157,21 @@ typedef struct {
     uint32_t          bounce_start;
     uint32_t          bounce_limit;
 
-    /* Live metering & pendulum motion trails */
+    /* Live metering, frame pacing & pendulum motion trails */
     volatile float    peak_l;
     volatile float    peak_r;
     int8_t            trail_deg[PM_NUM_MICS][TRAIL_LEN];
     uint32_t          last_trail_ms;
+    uint32_t          last_draw_ms;
+    bool              ui_dirty;
+
+    /* Cached header & card text so redraw() avoids per-frame snprintf/measure */
+    int16_t           cached_phi_pc;
+    int16_t           cached_phi_x;
+    char              cached_phi_str[16];
+    int16_t           cached_prm_pc[ENC_TOTAL];
+    int16_t           cached_prm_x[ENC_TOTAL];
+    char              cached_prm_str[ENC_TOTAL][8];
 
     /* 4 live performance encoder parameters */
     params_t          prm[ENC_TOTAL];
@@ -197,7 +217,7 @@ static void pm_sync_monitor(pm_model_t* m);
  * ------------------------------------------------------------------------- */
 static void apply_loop_splice(pm_frame_t* buf, uint32_t len) {
     if (!buf || len < 16u) return;
-    uint32_t fade = SPLICE_FADE_FR;
+    uint32_t fade = SPLICE_FADE_FR24;
     if (fade > (len >> 3)) fade = len >> 3;
     if (fade < 4u) return;
 
@@ -229,10 +249,11 @@ static void pm_sync_engine_active(pm_model_t* m) {
 }
 
 /*
- * Keep live input monitoring and WET FX-chain pass-through strictly OFF unless
- * actively capturing (ST_REC), preventing physical speaker bleed outside ST_REC.
+ * Event-driven monitor & WET gate: keeps live input monitoring strictly OFF
+ * unless actively capturing (ST_REC) past button-release settle.
  */
 static void pm_sync_monitor(pm_model_t* m) {
+    m->in_src = os_audio_get_input();
     const bool want_mon = (m->state == ST_REC) && !m->rec_done_req &&
                           !m->rec_btn_down && (m->rec_holdoff_fr == 0u);
     if (!want_mon) {
@@ -262,7 +283,7 @@ static void pm_tame_hot_mic_input(void) {
 }
 
 /* ----------------------------------------------------------------------------
- * Bounce-to-Tape Streaming (DMA windows)
+ * Bounce-to-Tape Streaming (DMA windows, full 48 kHz resolution)
  * ------------------------------------------------------------------------- */
 static bool bounce_free_region(tape_t* t, uint32_t* start_fr, uint32_t* limit_fr) {
     if (!t) return false;
@@ -320,6 +341,7 @@ static void pm_bounce_start(pm_model_t* m) {
     }
 
     m->bouncing = true;
+    m->ui_dirty = true;
     pm_sync_engine_active(m);
     pm_hints(m);
     ui_notify_toast(NotifyInfo, "Bouncing Pendulum Music", 1800u);
@@ -349,12 +371,13 @@ static void pm_bounce_stop(pm_model_t* m, tape_t* t) {
         ui_notify_toast(NotifySuccess, "Pendulum bounce saved", 1800u);
     }
 
+    m->ui_dirty = true;
     pm_sync_engine_active(m);
     pm_hints(m);
 }
 
 /* ----------------------------------------------------------------------------
- * Audio Engine (48 kHz real-time, zero blocking, single-precision f32 only)
+ * Audio Engine (24 kHz internal DSP -> hardware ups2x_f32_add -> 48 kHz bus)
  * ------------------------------------------------------------------------- */
 static inline void bounce_win_request(pm_model_t* m, uint32_t win) {
     tape_buffer_update(m->wb, win * TAPE_WINDOW_POS, true);
@@ -366,7 +389,7 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
     const float* in = mixer_get_record(mix);
     float* send = mixer_get_send(mix);
     const uint32_t fs = mixer_get_fs(mix);
-    if (!out) return;
+    if (!out || fs == 0u) return;
 
     const uint8_t st = m->state;
     const bool locked = m->buf_locked;
@@ -386,139 +409,134 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
     }
 
     if (locked) {
-        for (uint32_t i = 0u; i < fs; i += 2u) {
-            out[i] = 0.0f;
-            out[i + 1u] = 0.0f;
-        }
+        memset(out, 0, (size_t)fs * sizeof(float));
         return;
     }
 
     const float vout = m->vol_out.val;
     const float vfx = m->vol_fx.val;
-    const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
-    const float play_target = (st == ST_PLAY) ? 1.0f : 0.0f;
-    const float mode_target = (m->mode == PM_MODE_SOUND_VCA) ? 1.0f : 0.0f;
-    const float bounce_target = (bouncing && !m->bounce_stop_req) ? 1.0f : 0.0f;
-    const float play_step = 1.0f / 720.0f;      /* 15 ms play/stop ramp */
-    const float mode_step = 1.0f / 960.0f;      /* 20 ms glitch-free mode crossfade */
-    const float bounce_step = 1.0f / (float)BOUNCE_FADE_FR;
-
-    float* bbuf = bouncing ? tape_buffer_get_ptr(m->wb) : NULL;
     float pl = 0.0f;
     float pr = 0.0f;
 
-    const uint8_t rslot = m->rec_slot & 3u;
-    pm_frame_t* rec_dst = m->slot_buf[rslot];
+    /* Path A: Live 48k -> 24k decimated slot capture (output is muted during ST_REC) */
+    if (st == ST_REC) {
+        memset(out, 0, (size_t)fs * sizeof(float));
 
-    for (uint32_t i = 0u; i < fs; i += 2u) {
-        float ol = 0.0f;
-        float orr = 0.0f;
+        const uint8_t rslot = m->rec_slot & 3u;
+        pm_frame_t* rec_dst = m->slot_buf[rslot];
+        if (rec_dst && in) {
+            const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
+            for (uint32_t i = 0u; i + 3u < fs; i += 4u) {
+                float il = 0.5f * (in[i]      + in[i + 2u]) * itrim;
+                float ir = 0.5f * (in[i + 1u] + in[i + 3u]) * itrim;
 
-        if (st == ST_REC && rec_dst && in) {
-            float il = in[i] * itrim;
-            float ir = in[i + 1u] * itrim;
-
-            if (m->in_src == 1u) {
-                const float hpl = 0.9889f * (m->rec_hp_yl + il - m->rec_hp_xl);
-                const float hpr = 0.9889f * (m->rec_hp_yr + ir - m->rec_hp_xr);
-                m->rec_hp_xl = il;
-                m->rec_hp_yl = (fabsf(hpl) < 1.0e-18f) ? 0.0f : hpl;
-                m->rec_hp_xr = ir;
-                m->rec_hp_yr = (fabsf(hpr) < 1.0e-18f) ? 0.0f : hpr;
-                il = m->rec_hp_yl;
-                ir = m->rec_hp_yr;
-            }
-
-            if (m->rec_btn_down) {
-                m->rec_held_fr++;
-                if (m->rec_held_fr >= MIC_BTN_HELD_MAX_FR) {
-                    m->rec_btn_down = false;
+                if (m->in_src == 1u) {
+                    const float hpl = 0.9779f * (m->rec_hp_yl + il - m->rec_hp_xl);
+                    const float hpr = 0.9779f * (m->rec_hp_yr + ir - m->rec_hp_xr);
+                    m->rec_hp_xl = il;
+                    m->rec_hp_yl = hpl;
+                    m->rec_hp_xr = ir;
+                    m->rec_hp_yr = hpr;
+                    il = hpl;
+                    ir = hpr;
                 }
-            } else if (m->rec_holdoff_fr > 0u) {
-                m->rec_holdoff_fr--;
-            } else {
-                const uint32_t rf = m->rec_frames;
-                if (rf < m->max_slot_frames && !m->rec_done_req) {
-                    float fg = 1.0f;
-                    if (rf < REC_FADE_IN_FR) {
-                        const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR);
-                        fg = t * t * (3.0f - 2.0f * t);
+
+                if (m->rec_btn_down) {
+                    m->rec_held_fr++;
+                    if (m->rec_held_fr >= MIC_BTN_HELD_MAX_FR24) {
+                        m->rec_btn_down = false;
                     }
-                    rec_dst[rf].l = pm_clip_guard(il * fg);
-                    rec_dst[rf].r = pm_clip_guard(ir * fg);
-                    m->rec_frames = rf + 1u;
-                    if (m->rec_frames >= m->max_slot_frames) {
-                        m->rec_done_req = true;
+                } else if (m->rec_holdoff_fr > 0u) {
+                    m->rec_holdoff_fr--;
+                    if (m->rec_holdoff_fr == 0u) {
+                        m->mon_arm_req = true;
                     }
-                }
-                const float al = fabsf(il);
-                const float ar = fabsf(ir);
-                if (al > pl) pl = al;
-                if (ar > pr) pr = ar;
-            }
-        } else {
-            /* Smooth play envelope & Mode 1 <-> Mode 2 crossfade */
-            float pg = m->play_gain;
-            if (pg < play_target) {
-                pg += play_step;
-                if (pg > play_target) pg = play_target;
-            } else if (pg > play_target) {
-                pg -= play_step;
-                if (pg < play_target) pg = play_target;
-            }
-            m->play_gain = pg;
-
-            float mm = m->mode_mix;
-            if (mm < mode_target) {
-                mm += mode_step;
-                if (mm > mode_target) mm = mode_target;
-            } else if (mm > mode_target) {
-                mm -= mode_step;
-                if (mm < mode_target) mm = mode_target;
-            }
-            m->mode_mix = mm;
-
-            if (pg > 0.0001f || bouncing) {
-                pm_frame_t fbk = { 0.0f, 0.0f };
-                pm_dsp_step(&m->dsp, &fbk);
-
-                pm_frame_t vca = { 0.0f, 0.0f };
-                if (mm > 0.0001f) {
-                    pm_frame_t slot_samp[PM_NUM_MICS];
-                    const uint8_t c_mask = m->slot_custom;
-                    uint8_t valid_mask = 0u;
-                    if (c_mask != 0u) {
-                        for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
-                            if ((c_mask & (1u << s)) == 0u) continue;
-                            const uint32_t slen = m->slot_len[s];
-                            const pm_frame_t* sbuf = m->slot_buf[s];
-                            if (sbuf && slen >= 8u) {
-                                uint32_t hi = m->head_i[s];
-                                if (hi >= slen) hi = 0u;
-                                slot_samp[s] = sbuf[hi];
-                                hi++;
-                                if (hi >= slen) hi = 0u;
-                                m->head_i[s] = hi;
-                                valid_mask |= (uint8_t)(1u << s);
-                            }
+                } else {
+                    const uint32_t rf = m->rec_frames;
+                    if (rf < m->max_slot_frames && !m->rec_done_req) {
+                        float fg = 1.0f;
+                        if (rf < REC_FADE_IN_FR24) {
+                            const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR24);
+                            fg = t * t * (3.0f - 2.0f * t);
+                        }
+                        rec_dst[rf].l = pm_clip_guard(il * fg);
+                        rec_dst[rf].r = pm_clip_guard(ir * fg);
+                        m->rec_frames = rf + 1u;
+                        if (m->rec_frames >= m->max_slot_frames) {
+                            m->rec_done_req = true;
                         }
                     }
-                    vca = pm_render_sound_vca(&m->dsp, slot_samp, valid_mask);
+                    const float al = fabsf(il);
+                    const float ar = fabsf(ir);
+                    if (al > pl) pl = al;
+                    if (ar > pr) pr = ar;
                 }
-
-                const float dry_mix = 1.0f - mm;
-                ol  = (dry_mix * fbk.l + mm * vca.l) * pg;
-                orr = (dry_mix * fbk.r + mm * vca.r) * pg;
             }
+        }
+        m->peak_l = (pl > m->peak_l) ? pl : (m->peak_l * 0.85f);
+        m->peak_r = (pr > m->peak_r) ? pr : (m->peak_r * 0.85f);
+        return;
+    }
 
-            const float al = fabsf(ol);
-            const float ar = fabsf(orr);
-            if (al > pl) pl = al;
-            if (ar > pr) pr = ar;
+    /* Path B: 24 kHz coupled feedback + Sound VCA block engine -> 48 kHz upsample */
+    const float play_target = (st == ST_PLAY) ? 1.0f : 0.0f;
+    const float mode_target = (m->mode == PM_MODE_SOUND_VCA) ? 1.0f : 0.0f;
+
+    if (!m->space || (m->play_gain <= 0.0001f && play_target == 0.0f && !bouncing)) {
+        m->play_gain = 0.0f;
+        m->ups.prev_l = 0.0f;
+        m->ups.prev_r = 0.0f;
+        memset(out, 0, (size_t)fs * sizeof(float));
+        m->peak_l *= 0.85f;
+        m->peak_r *= 0.85f;
+        return;
+    }
+
+    memset(out, 0, (size_t)fs * sizeof(float));
+
+    const float play_step24 = 1.0f / 360.0f;    /* 15 ms play/stop ramp at 24 kHz */
+    const float mode_step24 = 1.0f / 480.0f;    /* 20 ms mode crossfade at 24 kHz */
+    float* const scratch24 = m->space->scratch24;
+
+    uint32_t pos48 = 0u;
+    while (pos48 + 3u < fs) {
+        uint32_t rem48 = (fs - pos48) & ~3u;
+        uint32_t n24 = rem48 >> 1;
+        if (n24 > PM_SCRATCH24) {
+            n24 = PM_SCRATCH24;
+            rem48 = n24 << 1;
         }
 
-        /* Optional Bounce-to-Tape DMA window streaming (unity pre-vout level) */
-        if (bouncing) {
+        pm_dsp_render_block24(&m->dsp,
+                              scratch24,
+                              n24 >> 1,
+                              play_target,
+                              play_step24,
+                              &m->play_gain,
+                              mode_target,
+                              mode_step24,
+                              &m->mode_mix,
+                              m->slot_buf,
+                              m->slot_len,
+                              m->head_i,
+                              m->slot_custom);
+
+        /* Upsample unity-level 24 kHz stereo render into 48 kHz `out` bus */
+        ups2x_f32_add(&m->ups, scratch24, out + pos48, n24);
+        pos48 += rem48;
+    }
+
+    /* Optional Bounce-to-Tape (unity pre-vout level) + headphone trim + FX send */
+    if (bouncing) {
+        float* bbuf = tape_buffer_get_ptr(m->wb);
+        const float bounce_target = !m->bounce_stop_req ? 1.0f : 0.0f;
+        const float bounce_step = 1.0f / (float)BOUNCE_FADE_FR;
+        float bg = m->bounce_gain;
+
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+
             const uint32_t bf = m->bounce_frame;
             const uint32_t win = bf / TAPE_WINDOW_FR;
             if (win != m->bounce_cur_win) {
@@ -530,7 +548,6 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
                 bbuf = tape_buffer_get_ptr(m->wb);
             }
 
-            float bg = m->bounce_gain;
             if (bg < bounce_target) {
                 bg += bounce_step;
                 if (bg > bounce_target) bg = bounce_target;
@@ -538,23 +555,41 @@ static void pm_process(void* restrict ctx, mixer_t* restrict mix) {
                 bg -= bounce_step;
                 if (bg < bounce_target) bg = bounce_target;
             }
-            m->bounce_gain = bg;
 
             if (bbuf && (bg > 0.0f || !m->bounce_stop_req) && bf < m->bounce_limit) {
                 const uint32_t off = (bf & (TAPE_WINDOW_FR - 1u)) * 2u;
-                bbuf[off]      = clampf(ol * bg, -1.0f, 1.0f);
-                bbuf[off + 1u] = clampf(orr * bg, -1.0f, 1.0f);
+                bbuf[off]      = clampf(ul * bg, -1.0f, 1.0f);
+                bbuf[off + 1u] = clampf(ur * bg, -1.0f, 1.0f);
                 m->bounce_frame = bf + 1u;
             }
         }
+        m->bounce_gain = bg;
+    }
 
-        const float out_l = ol * vout;
-        const float out_r = orr * vout;
-        out[i]      = out_l;
-        out[i + 1u] = out_r;
-        if (send) {
-            send[i]      += out_l * vfx;
-            send[i + 1u] += out_r * vfx;
+    if (send && vfx > 0.0001f) {
+        const float send_g = vout * vfx;
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+            const float al = fabsf(ul);
+            const float ar = fabsf(ur);
+            if (al > pl) pl = al;
+            if (ar > pr) pr = ar;
+            out[i]      = ul * vout;
+            out[i + 1u] = ur * vout;
+            send[i]      += ul * send_g;
+            send[i + 1u] += ur * send_g;
+        }
+    } else {
+        for (uint32_t i = 0u; i + 1u < fs; i += 2u) {
+            const float ul = out[i];
+            const float ur = out[i + 1u];
+            const float al = fabsf(ul);
+            const float ar = fabsf(ur);
+            if (al > pl) pl = al;
+            if (ar > pr) pr = ar;
+            out[i]      = ul * vout;
+            out[i + 1u] = ur * vout;
         }
     }
 
@@ -584,8 +619,7 @@ static const engine_callbacks_t pm_engine_cb = {
 };
 
 /* ----------------------------------------------------------------------------
- * RGB LEDs (LEDs 0..3 mirror Mics M1..M4 live feedback envelopes env[0..3])
- * Mode 1: warm gallery tungsten-amber; Mode 2: luminous cyan-ivory.
+ * RGB LEDs (pure integer math on OS LED task, 25 Hz)
  * ------------------------------------------------------------------------- */
 static void pm_led_step(const os_led_t* led, const void* ctx) {
     const uint8_t step = os_led_get_step(led);
@@ -610,23 +644,26 @@ static void pm_led_step(const os_led_t* led, const void* ctx) {
             continue;
         }
 
-        float br = playing ? (0.06f + 0.94f * clampf(m->dsp.env[i], 0.0f, 1.0f)) : 0.08f;
-        if (m->mode == PM_MODE_SOUND_VCA && i == (m->rec_slot & 3u) && !playing) {
-            br = 0.28f;
+        uint32_t br_q8 = 20u; /* ~8% idle glow */
+        if (playing) {
+            int32_t e_q8 = (int32_t)(m->dsp.env[i] * 240.0f);
+            if (e_q8 < 0) e_q8 = 0;
+            if (e_q8 > 240) e_q8 = 240;
+            br_q8 = 15u + (uint32_t)e_q8;
+        } else if (m->mode == PM_MODE_SOUND_VCA && i == (m->rec_slot & 3u)) {
+            br_q8 = 72u;
         }
 
         if (m->mode == PM_MODE_FEEDBACK) {
-            /* Mode 1 (FEEDBACK): warm 1968 gallery tungsten amber-gold */
-            const uint8_t r = (uint8_t)(72.0f * br);
-            const uint8_t g = (uint8_t)(44.0f * br);
-            const uint8_t b = (uint8_t)(10.0f * br);
-            hal_led_set_rgb(i, r, g, b);
+            hal_led_set_rgb(i,
+                            (uint8_t)((72u * br_q8) >> 8),
+                            (uint8_t)((44u * br_q8) >> 8),
+                            (uint8_t)((10u * br_q8) >> 8));
         } else {
-            /* Mode 2 (SOUND VCA): luminous cyan-ivory */
-            const uint8_t r = (uint8_t)(24.0f * br);
-            const uint8_t g = (uint8_t)(58.0f * br);
-            const uint8_t b = (uint8_t)(68.0f * br);
-            hal_led_set_rgb(i, r, g, b);
+            hal_led_set_rgb(i,
+                            (uint8_t)((24u * br_q8) >> 8),
+                            (uint8_t)((58u * br_q8) >> 8),
+                            (uint8_t)((68u * br_q8) >> 8));
         }
     }
 }
@@ -634,7 +671,7 @@ static void pm_led_step(const os_led_t* led, const void* ctx) {
 static led_pattern_t pm_led_pattern = {
     .callback = pm_led_step,
     .steps = 255u,
-    .rate = 30u,
+    .rate = 40u,
     .loop = true,
 };
 
@@ -648,6 +685,7 @@ static void pm_do_seed_bank(pm_model_t* m, bool show_toast) {
         strncpy(m->slot_tag[s], pm_bank_slot_tag(m->bank_idx, (uint8_t)s), 5u);
         m->slot_tag[s][5] = '\0';
     }
+    m->ui_dirty = true;
 
     if (show_toast) {
         char msg[32];
@@ -664,17 +702,18 @@ static void pm_finish_capture(pm_model_t* m) {
     uint32_t captured = m->rec_frames;
     const uint8_t slot = m->rec_slot & 3u;
     if (m->in_src == 1u && m->rec_manual_stop) {
-        if (captured > MIN_LOOP_FR + MIC_STOP_TRIM_FR) {
-            captured -= MIC_STOP_TRIM_FR;
-        } else if (captured > MIN_LOOP_FR) {
-            captured = MIN_LOOP_FR;
+        if (captured > MIN_LOOP_FR24 + MIC_STOP_TRIM_FR24) {
+            captured -= MIC_STOP_TRIM_FR24;
+        } else if (captured > MIN_LOOP_FR24) {
+            captured = MIN_LOOP_FR24;
         }
     }
     m->rec_manual_stop = false;
 
-    if (captured < MIN_LOOP_FR) {
+    if (captured < MIN_LOOP_FR24) {
         m->state = ST_STOP;
         m->buf_locked = false;
+        m->ui_dirty = true;
         pm_sync_monitor(m);
         pm_sync_engine_active(m);
         pm_hints(m);
@@ -688,7 +727,6 @@ static void pm_finish_capture(pm_model_t* m) {
     m->slot_custom |= (uint8_t)(1u << slot);
     strcpy(m->slot_tag[slot], "USER");
 
-    /* Switch to Mode 2 so user immediately hears their recorded sound on this pendulum */
     m->mode = PM_MODE_SOUND_VCA;
     m->rec_slot = (uint8_t)((slot + 1u) & 3u);
     if (pm_all_nearly_still(&m->dsp, 3.0f) || m->dsp.plug_pulled) {
@@ -697,6 +735,7 @@ static void pm_finish_capture(pm_model_t* m) {
 
     m->state = ST_PLAY;
     m->buf_locked = false;
+    m->ui_dirty = true;
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     pm_hints(m);
@@ -709,13 +748,15 @@ static void pm_finish_capture(pm_model_t* m) {
 static bool pm_prep_single_take(pm_model_t* m, tape_t* t, uint32_t take_idx, uint8_t dst_slot) {
     uint32_t s = 0u, e = 0u;
     if (!tape_marks_get(t, take_idx, &s, &e) || e <= s) return false;
-    uint32_t len = e - s;
-    if (len > m->max_slot_frames) len = m->max_slot_frames;
-    if (len < MIN_LOOP_FR) return false;
+    uint32_t len48 = (e - s) & ~1u;
+    const uint32_t max48 = m->max_slot_frames * 2u;
+    if (len48 > max48) len48 = max48;
+    if ((len48 >> 1) < MIN_LOOP_FR24) return false;
 
-    m->load_src_frame = s;
-    m->load_total = len;
-    m->load_done = 0u;
+    m->load_src_frame48 = s;
+    m->load_total48 = len48;
+    m->load_done48 = 0u;
+    m->load_written24 = 0u;
     m->load_dst_slot = dst_slot & 3u;
     m->load_take_idx = take_idx;
     return true;
@@ -754,6 +795,7 @@ static void pm_start_take_load(pm_model_t* m, uint32_t take_idx, bool batch_firs
     }
 
     m->state = ST_LOADING;
+    m->ui_dirty = true;
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     pm_hints(m);
@@ -765,29 +807,41 @@ static void pm_step_take_load(pm_model_t* m) {
     if (!t || !m->read_stage || !m->slot_buf[dst]) {
         m->state = ST_STOP;
         m->buf_locked = false;
+        m->ui_dirty = true;
         return;
     }
 
-    const uint32_t rem = m->load_total - m->load_done;
-    const uint32_t chunk = (rem > LOAD_CHUNK_FR) ? LOAD_CHUNK_FR : rem;
-    const uint32_t got = tape_read(t, m->load_src_frame + m->load_done, m->read_stage, chunk);
-    if (got == 0u) {
+    const uint32_t rem48 = m->load_total48 - m->load_done48;
+    uint32_t chunk48 = (rem48 > LOAD_CHUNK_FR48) ? LOAD_CHUNK_FR48 : rem48;
+    chunk48 &= ~1u;
+    if (chunk48 == 0u) chunk48 = rem48;
+
+    const uint32_t got48 = tape_read(t, m->load_src_frame48 + m->load_done48, m->read_stage, chunk48);
+    if (got48 < 2u) {
         m->state = ST_STOP;
         m->buf_locked = false;
+        m->ui_dirty = true;
         ui_notify_toast(NotifyError, "Tape read failed", 1800u);
         return;
     }
 
     pm_frame_t* sbuf = m->slot_buf[dst];
-    for (uint32_t i = 0u; i < got; ++i) {
-        sbuf[m->load_done + i].l = pm_clip_guard(m->read_stage[i * 2u]);
-        sbuf[m->load_done + i].r = pm_clip_guard(m->read_stage[i * 2u + 1u]);
+    const uint32_t pairs = got48 >> 1;
+    uint32_t wr24 = m->load_written24;
+    for (uint32_t p = 0u; p < pairs && wr24 < m->max_slot_frames; ++p) {
+        const uint32_t b = p * 4u;
+        const float l = 0.5f * (m->read_stage[b]      + m->read_stage[b + 2u]);
+        const float r = 0.5f * (m->read_stage[b + 1u] + m->read_stage[b + 3u]);
+        sbuf[wr24].l = pm_clip_guard(l);
+        sbuf[wr24].r = pm_clip_guard(r);
+        wr24++;
     }
-    m->load_done += got;
+    m->load_written24 = wr24;
+    m->load_done48 += got48;
 
-    if (m->load_done >= m->load_total) {
-        apply_loop_splice(sbuf, m->load_done);
-        m->slot_len[dst] = m->load_done;
+    if (m->load_done48 >= m->load_total48 || wr24 >= m->max_slot_frames) {
+        apply_loop_splice(sbuf, wr24);
+        m->slot_len[dst] = wr24;
         m->head_i[dst] = 0u;
         m->slot_custom |= (uint8_t)(1u << dst);
         snprintf(m->slot_tag[dst], sizeof(m->slot_tag[dst]), "TK%u",
@@ -807,6 +861,7 @@ static void pm_step_take_load(pm_model_t* m) {
             }
             m->state = ST_PLAY;
             m->buf_locked = false;
+            m->ui_dirty = true;
             pm_sync_monitor(m);
             pm_sync_engine_active(m);
             pm_hints(m);
@@ -819,6 +874,7 @@ static void pm_step_take_load(pm_model_t* m) {
             }
             m->state = ST_PLAY;
             m->buf_locked = false;
+            m->ui_dirty = true;
             pm_sync_monitor(m);
             pm_sync_engine_active(m);
             pm_hints(m);
@@ -837,6 +893,7 @@ static void menu_act_pull_release(ui_menu_t* menu, ui_menu_node_t* entry) {
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     m->pull_req = true;
     m->state = ST_PLAY;
+    m->ui_dirty = true;
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     pm_hints(m);
@@ -848,6 +905,7 @@ static void menu_act_pull_plug(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     m->plug_req = true;
+    m->ui_dirty = true;
     ui_menu_hide(menu);
     ui_notify_toast(NotifyInfo, "Pulled PA power plug", 1800u);
 }
@@ -856,6 +914,7 @@ static void menu_act_toggle_mode(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     m->mode = (m->mode == PM_MODE_FEEDBACK) ? PM_MODE_SOUND_VCA : PM_MODE_FEEDBACK;
+    m->ui_dirty = true;
     pm_hints(m);
     ui_menu_rebuild(menu);
 }
@@ -866,6 +925,7 @@ static void menu_act_cycle_bank(ui_menu_t* menu, ui_menu_node_t* entry) {
     m->bank_idx = (uint8_t)((m->bank_idx + 1u) % PM_BANK_COUNT);
     m->mode = PM_MODE_SOUND_VCA;
     m->seed_req = true;
+    m->ui_dirty = true;
     ui_menu_hide(menu);
 }
 
@@ -873,6 +933,7 @@ static void menu_act_cycle_target(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     m->rec_slot = (uint8_t)((m->rec_slot + 1u) & 3u);
+    m->ui_dirty = true;
     ui_menu_rebuild(menu);
 }
 
@@ -894,13 +955,14 @@ static void menu_takes_builder(ui_menu_t* menu) {
     }
 
     const uint32_t count = (n > MAX_MENU_TAKES) ? MAX_MENU_TAKES : n;
+    const uint32_t max48 = m->max_slot_frames * 2u;
     for (uint32_t i = 0u; i < count; ++i) {
         uint32_t s = 0u, e = 0u;
         uint32_t dur_ds = 0u;
         if (tape_marks_get(t, i, &s, &e) && e > s) {
-            uint32_t frames = e - s;
-            if (frames > m->max_slot_frames) frames = m->max_slot_frames;
-            dur_ds = frames / 4800u;
+            uint32_t frames48 = e - s;
+            if (frames48 > max48) frames48 = max48;
+            dur_ds = frames48 / 4800u;
         }
         snprintf(m->take_labels[i], sizeof(m->take_labels[i]), "Take %u (%u.%us)",
                  (unsigned)(i + 1u), (unsigned)(dur_ds / 10u), (unsigned)(dur_ds % 10u));
@@ -919,6 +981,7 @@ static void menu_act_toggle_release(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     pm_set_release_stagger(&m->dsp, !m->dsp.release_stagger);
+    m->ui_dirty = true;
     ui_menu_rebuild(menu);
 }
 
@@ -926,6 +989,7 @@ static void menu_act_cycle_tuning(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     pm_set_tuning(&m->dsp, (uint8_t)((m->dsp.tuning_mode + 1u) % PM_TUNING_COUNT));
+    m->ui_dirty = true;
     ui_menu_rebuild(menu);
 }
 
@@ -936,6 +1000,7 @@ static void menu_act_input(ui_menu_t* menu, ui_menu_node_t* entry) {
     m->mon_req = false;
     pm_tame_hot_mic_input();
     pm_sync_monitor(m);
+    m->ui_dirty = true;
     ui_menu_rebuild(menu);
 }
 
@@ -943,6 +1008,7 @@ static void menu_act_reseed(ui_menu_t* menu, ui_menu_node_t* entry) {
     (void)entry;
     pm_model_t* m = (pm_model_t*)ui_menu_ctx(menu);
     m->seed_req = true;
+    m->ui_dirty = true;
     ui_menu_hide(menu);
 }
 
@@ -1020,11 +1086,12 @@ static void pm_vol_show(pm_model_t* m) {
 
 static void pm_vol_hide(pm_model_t* m) {
     m->vol_ui = false;
+    m->ui_dirty = true;
     pm_hints(m);
 }
 
 /* ----------------------------------------------------------------------------
- * Drawing (400x240 1-bit monochrome OLED, content y = 48..240)
+ * Drawing (400x240 1-bit OLED, fast cached labels & low-cost vector primitives)
  * ------------------------------------------------------------------------- */
 #define GALLERY_X     8
 #define GALLERY_Y     71
@@ -1040,6 +1107,9 @@ static void pm_vol_hide(pm_model_t* m) {
 #define CARD_W        93
 #define CARD_GAP      4
 
+static const char* const kBayNames[PM_NUM_MICS] = { "M1", "M2", "M3", "M4" };
+static const char* const kRecBadges[PM_NUM_MICS] = { "REC M1", "REC M2", "REC M3", "REC M4" };
+
 static void bay_pendulum_pt(int piv_x, int r, float deg, int* out_x, int* out_y) {
     const int32_t q16 = (int32_t)(deg * (65536.0f / 360.0f));
     const uint16_t ang = (uint16_t)(q16 & 0xFFFFu);
@@ -1049,16 +1119,17 @@ static void bay_pendulum_pt(int piv_x, int r, float deg, int* out_x, int* out_y)
     *out_y = PIV_Y + ((cy * r + (cy >= 0 ? 16384 : -16384)) >> 15);
 }
 
-static void draw_header(gfx_t* gfx, const pm_model_t* m) {
+static void draw_header(gfx_t* gfx, pm_model_t* m) {
     gfx_set_color(gfx, GFX_COLOR_SET);
     gfx_set_font(gfx, DepartureMono_Regular_10);
 
     gfx_draw_str(gfx, 8, 63, "PENDULUM MUSIC");
-    int tx = 8 + (int)gfx_get_str_width(gfx, "PENDULUM MUSIC") + 6;
+    int tx = 104;
 
-    /* Inverted Mode Pill Badge: 1:FEEDBACK or 2:SOUND VCA */
-    const char* mode_s = (m->mode == PM_MODE_SOUND_VCA) ? "2:SOUND VCA" : "1:FEEDBACK";
-    const int mw = (int)gfx_get_str_width(gfx, mode_s) + 8;
+    /* Inverted Mode Pill Badge: 1:FEEDBACK (68 px) or 2:SOUND VCA (74 px) */
+    const bool is_vca = (m->mode == PM_MODE_SOUND_VCA);
+    const char* mode_s = is_vca ? "2:SOUND VCA" : "1:FEEDBACK";
+    const int mw = is_vca ? 74 : 68;
     gfx_draw_rect_fill_r(gfx, tx, 52, mw, 15, 2);
     gfx_set_color(gfx, GFX_COLOR_CLEAR);
     gfx_draw_str(gfx, tx + 4, 63, mode_s);
@@ -1066,28 +1137,31 @@ static void draw_header(gfx_t* gfx, const pm_model_t* m) {
     tx += mw + 5;
 
     /* State Badge */
-    char st_buf[16];
     const char* st_s = "STOPPED";
+    int sw = 50;
     bool inv_st = false;
     if (m->state == ST_REC) {
-        snprintf(st_buf, sizeof(st_buf), "REC M%u", (unsigned)((m->rec_slot & 3u) + 1u));
-        st_s = st_buf;
+        st_s = kRecBadges[m->rec_slot & 3u];
+        sw = 44;
         inv_st = (((os_tick_get() / 280u) & 1u) == 0u);
     } else if (m->state == ST_LOADING) {
         st_s = "LOADING";
+        sw = 50;
         inv_st = true;
     } else if (m->state == ST_PLAY) {
         if (m->dsp.plug_pulled) {
             st_s = "UNPLUGGED";
+            sw = 62;
         } else if (pm_all_nearly_still(&m->dsp, 2.5f)) {
             st_s = "REST CHORD";
+            sw = 68;
             inv_st = true;
         } else {
             st_s = "SWINGING";
+            sw = 56;
         }
     }
 
-    const int sw = (int)gfx_get_str_width(gfx, st_s) + 8;
     if (inv_st) {
         gfx_draw_rect_fill_r(gfx, tx, 52, sw, 15, 2);
         gfx_set_color(gfx, GFX_COLOR_CLEAR);
@@ -1098,19 +1172,23 @@ static void draw_header(gfx_t* gfx, const pm_model_t* m) {
         gfx_draw_str(gfx, tx + 4, 63, st_s);
     }
 
-    /* Right-aligned bounce timer or live inter-mic phase coherence */
-    char rtxt[20];
+    /* Right-aligned bounce timer or cached live inter-mic phase coherence */
     if (m->bouncing) {
+        char rtxt[16];
         const uint32_t bsec = (m->bounce_frame - m->bounce_start) / TAPP_SAMPLE_RATE;
         snprintf(rtxt, sizeof(rtxt), "R%02u:%02u",
                  (unsigned)(bsec / 60u), (unsigned)(bsec % 60u));
+        gfx_draw_str(gfx, 354, 63, rtxt);
     } else {
-        const int sync_pc = (int)(m->dsp.phase_sync * 100.0f +
-                                  (m->dsp.phase_sync >= 0.0f ? 0.5f : -0.5f));
-        snprintf(rtxt, sizeof(rtxt), "PHI %+d%%", sync_pc);
+        const int16_t sync_pc = (int16_t)(m->dsp.phase_sync * 100.0f +
+                                          (m->dsp.phase_sync >= 0.0f ? 0.5f : -0.5f));
+        if (sync_pc != m->cached_phi_pc) {
+            m->cached_phi_pc = sync_pc;
+            snprintf(m->cached_phi_str, sizeof(m->cached_phi_str), "PHI %+d%%", (int)sync_pc);
+            m->cached_phi_x = (int16_t)(392 - (int)gfx_get_str_width(gfx, m->cached_phi_str));
+        }
+        gfx_draw_str(gfx, m->cached_phi_x, 63, m->cached_phi_str);
     }
-    const int rw = (int)gfx_get_str_width(gfx, rtxt);
-    gfx_draw_str(gfx, 392 - rw, 63, rtxt);
 }
 
 static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
@@ -1125,8 +1203,8 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         const int mw = (int)gfx_get_str_width(gfx, msg);
         gfx_draw_str(gfx, GALLERY_X + (GALLERY_W - mw) / 2, GALLERY_Y + 34, msg);
 
-        const float pct = (m->load_total > 0u)
-                              ? ((float)m->load_done / (float)m->load_total)
+        const float pct = (m->load_total48 > 0u)
+                              ? ((float)m->load_done48 / (float)m->load_total48)
                               : 0.0f;
         gfx_draw_rect_r(gfx, GALLERY_X + 36, GALLERY_Y + 48, GALLERY_W - 72, 14, 3);
         const int fw = (int)(clampf(pct, 0.0f, 1.0f) * (float)(GALLERY_W - 76) + 0.5f);
@@ -1152,8 +1230,8 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
             gfx_draw_rect_fill(gfx, GALLERY_X + 4 + fill_w - 3, mid_y - mh, 3, mh * 2 + 1);
         }
 
-        const uint32_t ds = m->rec_frames / 4800u;
-        const uint32_t max_ds = m->max_slot_frames / 4800u;
+        const uint32_t ds = m->rec_frames / 2400u;
+        const uint32_t max_ds = m->max_slot_frames / 2400u;
         gfx_set_font(gfx, DepartureMono_Regular_10);
         gfx_draw_strf(gfx, GALLERY_X + 12, GALLERY_Y + GALLERY_H - 10,
                       "RECORDING MIC %u SOUND: %u.%us / %u.%us  (BTN2 = DONE)",
@@ -1182,12 +1260,9 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
             gfx_draw_vline_dithered(gfx, bx - 1, GALLERY_Y + 4, GALLERY_H - 8, 1);
         }
 
-        /* Overhead cable clamp */
         gfx_draw_rect_fill(gfx, px_piv - 2, TRUSS_Y - 2, 5, 3);
 
-        /* Bay label M1..M4 (highlight active Rec Target slot) */
-        char m_lbl[4];
-        snprintf(m_lbl, sizeof(m_lbl), "M%u", (unsigned)(i + 1u));
+        const char* m_lbl = kBayNames[i];
         const bool is_tgt = (i == (m->rec_slot & 3u));
         if (is_tgt && m->mode == PM_MODE_SOUND_VCA) {
             gfx_draw_rect_fill_r(gfx, bx + 3, GALLERY_Y + 5, 18, 12, 2);
@@ -1198,42 +1273,29 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
             gfx_draw_str(gfx, bx + 4, GALLERY_Y + 15, m_lbl);
         }
 
-        /* Visual cable radius reflects staggered L_i (37..47 px) */
         const float l_norm = clampf((m->dsp.cable_len[i] - 1.85f) * (1.0f / 0.85f), 0.0f, 1.0f);
         const int r_vis = 37 + (int)(l_norm * 10.0f + 0.5f);
 
-        /* Subtle dithered motion trail */
+        /* Fast 2-pip motion trail */
         for (uint32_t t = 0u; t < TRAIL_LEN; ++t) {
             const float tdeg = (float)m->trail_deg[i][t];
-            if (fabsf(tdeg - m->dsp.deg[i]) < 2.0f) continue;
+            if (fabsf(tdeg - m->dsp.deg[i]) < 2.5f) continue;
             int gx = 0, gy = 0;
             bay_pendulum_pt(px_piv, r_vis, tdeg, &gx, &gy);
-            gfx_fill_rect_dithered(gfx, gx - 2, gy - 1, 5, 3, (uint8_t)(1u + t * 2u));
+            gfx_draw_rect_fill(gfx, gx, gy, (int)(t + 1u), (int)(t + 1u));
         }
 
-        /* Live swinging microphone cable + tilted capsule */
+        /* Live swinging microphone cable + capsule */
         int mx = 0, my = 0;
         bay_pendulum_pt(px_piv, r_vis, m->dsp.deg[i], &mx, &my);
         mic_x[i] = mx;
         mic_y[i] = my;
         gfx_draw_line(gfx, px_piv, PIV_Y, mx, my);
-
-        const int32_t q16 = (int32_t)(m->dsp.deg[i] * (65536.0f / 360.0f));
-        const uint16_t ang = (uint16_t)(q16 & 0xFFFFu);
-        const float st = (float)lutsin_q15(ang) * (1.0f / 32768.0f);
-        const float ct = (float)lutcos_q15(ang) * (1.0f / 32768.0f);
-
-        const int tip_x = mx + (int)(4.0f * st);
-        const int tip_y = my + (int)(4.0f * ct);
-        const int base_x = mx - (int)(2.0f * st);
-        const int base_y = my - (int)(2.0f * ct);
-        gfx_draw_line(gfx, base_x, base_y, tip_x, tip_y);
-        gfx_draw_line(gfx, base_x + 1, base_y, tip_x + 1, tip_y);
-        gfx_draw_disc(gfx, tip_x, tip_y, 2, GFX_DRAW_ALL);
+        gfx_draw_rect_fill(gfx, mx - 2, my - 1, 5, 4);
 
         const float env = clampf(m->dsp.env[i], 0.0f, 1.0f);
         if (env > 0.25f) {
-            gfx_draw_circle(gfx, tip_x, tip_y, 4, GFX_DRAW_ALL);
+            gfx_draw_rect(gfx, mx - 4, my - 3, 9, 8);
         }
 
         /* Upward-facing floor speaker cabinet & flared cone */
@@ -1242,11 +1304,12 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         gfx_draw_line(gfx, px_piv + 9, FLOOR_Y, px_piv + 13, FLOOR_Y - 4);
         gfx_draw_hline(gfx, px_piv - 13, FLOOR_Y - 4, 27);
 
-        /* Concentric upward acoustic feedback wave arcs above floor speaker */
-        const int arcs = (int)(env * 3.8f);
-        for (int a = 1; a <= arcs; ++a) {
-            gfx_draw_circle(gfx, px_piv, FLOOR_Y - 4, (uint16_t)(3 + a * 3),
-                            GFX_DRAW_UPPER_LEFT | GFX_DRAW_UPPER_RIGHT);
+        /* Fast horizontal acoustic wavefront bars rising from speaker cone */
+        const int waves = (int)(env * 3.6f);
+        for (int w = 1; w <= waves; ++w) {
+            const int wy = FLOOR_Y - 4 - w * 4;
+            const int half_w = 6 + w * 3;
+            gfx_draw_hline(gfx, px_piv - half_w, wy, half_w * 2 + 1);
         }
 
         /* Right-edge per-bay live feedback / VCA vertical bar meter */
@@ -1259,29 +1322,25 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
             gfx_draw_rect_fill(gfx, vx + 1, vy + vh - 1 - fill_h, 3, fill_h);
         }
 
-        /* Bottom slot / source tag */
         const char* tag = (m->mode == PM_MODE_SOUND_VCA) ? m->slot_tag[i] : "FBK";
         gfx_draw_str(gfx, bx + 4, GALLERY_Y + GALLERY_H - 4, tag);
     }
 
-    /* Inter-bay phase-coupling link indicators (constructive lock vs destructive cancel) */
+    /* Inter-bay phase-coupling link indicators */
     if (m->prm[ENC_COUPLE].val > 0.04f && m->state == ST_PLAY) {
         for (uint32_t i = 0u; i < 3u; ++i) {
             const float coh = m->dsp.pair_coh[i];
             const float act = m->dsp.env[i] + m->dsp.env[i + 1u];
             if (act < 0.08f) continue;
 
-            const int mid_x = (mic_x[i] + mic_x[i + 1u]) / 2;
-            const int mid_y = (mic_y[i] + mic_y[i + 1u]) / 2;
-
             if (coh > 0.14f) {
-                /* Constructive in-phase surge: taut acoustic phase-lock bridge */
+                const int mid_x = (mic_x[i] + mic_x[i + 1u]) >> 1;
+                const int mid_y = (mic_y[i] + mic_y[i + 1u]) >> 1;
                 gfx_draw_line(gfx, mic_x[i], mic_y[i], mic_x[i + 1u], mic_y[i + 1u]);
-                gfx_draw_disc(gfx, mid_x, mid_y, 2, GFX_DRAW_ALL);
+                gfx_draw_rect_fill(gfx, mid_x - 1, mid_y - 1, 3, 3);
             } else if (coh < -0.14f) {
-                /* Destructive out-of-phase cancellation: dithered line + node cross */
-                const int lx = (piv_xs[i] + piv_xs[i + 1u]) / 2;
-                gfx_draw_hline_dithered(gfx, lx - 10, FLOOR_Y - 14, 21, 3);
+                const int lx = (piv_xs[i] + piv_xs[i + 1u]) >> 1;
+                gfx_draw_hline_dithered(gfx, lx - 9, FLOOR_Y - 14, 19, 3);
                 gfx_draw_line(gfx, lx - 2, FLOOR_Y - 16, lx + 2, FLOOR_Y - 12);
                 gfx_draw_line(gfx, lx - 2, FLOOR_Y - 12, lx + 2, FLOOR_Y - 16);
             }
@@ -1289,7 +1348,8 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
     }
 }
 
-static void draw_param_cards(gfx_t* gfx, const pm_model_t* m) {
+static void draw_param_cards(gfx_t* gfx, pm_model_t* m) {
+    gfx_set_font(gfx, DepartureMono_Regular_10);
     for (uint8_t idx = 0u; idx < ENC_TOTAL; ++idx) {
         const int x = 8 + (int)idx * (CARD_W + CARD_GAP);
         const bool sel = (m->enc_sel == idx);
@@ -1297,19 +1357,20 @@ static void draw_param_cards(gfx_t* gfx, const pm_model_t* m) {
 
         gfx_set_color(gfx, GFX_COLOR_SET);
         ui_draw_frame(gfx, x, CARD_Y, CARD_W, CARD_H, 3, sel);
-
-        gfx_set_font(gfx, DepartureMono_Regular_10);
         gfx_draw_str(gfx, x + 5, CARD_Y + 13, p->name);
 
-        char val_s[12];
-        const int pc = (int)(p->val * 100.0f + 0.5f);
-        if (idx == ENC_DECAY && pc == 0) {
-            strcpy(val_s, "INF");
-        } else {
-            snprintf(val_s, sizeof(val_s), "%d%%", pc);
+        const int16_t pc = (int16_t)(p->val * 100.0f + 0.5f);
+        if (pc != m->cached_prm_pc[idx]) {
+            m->cached_prm_pc[idx] = pc;
+            if (idx == ENC_DECAY && pc == 0) {
+                strcpy(m->cached_prm_str[idx], "INF");
+            } else {
+                snprintf(m->cached_prm_str[idx], sizeof(m->cached_prm_str[idx]), "%d%%", (int)pc);
+            }
+            m->cached_prm_x[idx] = (int16_t)(x + CARD_W - 5 -
+                                             (int)gfx_get_str_width(gfx, m->cached_prm_str[idx]));
         }
-        const int vw = (int)gfx_get_str_width(gfx, val_s);
-        gfx_draw_str(gfx, x + CARD_W - 5 - vw, CARD_Y + 13, val_s);
+        gfx_draw_str(gfx, m->cached_prm_x[idx], CARD_Y + 13, m->cached_prm_str[idx]);
 
         const int bx = x + 6;
         const int by = CARD_Y + 22;
@@ -1325,7 +1386,7 @@ static void draw_param_cards(gfx_t* gfx, const pm_model_t* m) {
 }
 
 static void pm_redraw(gfx_t* gfx, const os_app_t* app) {
-    const pm_model_t* m = (const pm_model_t*)os_app_get_model(app);
+    pm_model_t* m = (pm_model_t*)os_app_get_model(app);
     if (!m) return;
 
     draw_header(gfx, m);
@@ -1334,7 +1395,7 @@ static void pm_redraw(gfx_t* gfx, const os_app_t* app) {
 }
 
 /* ----------------------------------------------------------------------------
- * Tick (main UI thread — safe for tape_read, menu updates & trail history)
+ * Tick (main UI thread — 30 fps frame-paced while active, zero-cost when idle)
  * ------------------------------------------------------------------------- */
 static bool pm_tick(os_app_t* app) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
@@ -1351,11 +1412,17 @@ static bool pm_tick(os_app_t* app) {
         m->bounce_cur_win = WIN_NONE;
         tape_timeline_set_loop(false);
         pm_hints(m);
+        m->ui_dirty = true;
     }
 
     if (m->seed_req) {
         m->seed_req = false;
         pm_do_seed_bank(m, true);
+    }
+
+    if (m->mon_arm_req) {
+        m->mon_arm_req = false;
+        pm_sync_monitor(m);
     }
 
     if (m->state == ST_LOADING) {
@@ -1377,12 +1444,10 @@ static bool pm_tick(os_app_t* app) {
         }
     }
 
-    m->in_src = os_audio_get_input();
-    pm_sync_monitor(m);
     pm_sync_engine_active(m);
 
-    /* Update per-pendulum motion trail every ~75 ms */
-    if (now_ms - m->last_trail_ms >= 75u) {
+    /* Update per-pendulum motion trail every ~90 ms only while swinging */
+    if (m->state == ST_PLAY && (now_ms - m->last_trail_ms >= 90u)) {
         m->last_trail_ms = now_ms;
         for (uint32_t i = 0u; i < PM_NUM_MICS; ++i) {
             for (uint32_t k = 0u; k + 1u < TRAIL_LEN; ++k) {
@@ -1401,6 +1466,7 @@ static bool pm_tick(os_app_t* app) {
             param_write_delta_val(p, d);
             param_update_fast(p, m);
             sync_params_to_dsp(m);
+            m->ui_dirty = true;
         }
     }
 
@@ -1418,14 +1484,30 @@ static bool pm_tick(os_app_t* app) {
         m->hint_mode = m->mode;
         m->hint_bounce = m->bouncing;
         pm_hints(m);
+        m->ui_dirty = true;
     }
 
-    return true;
+    const bool animating = (m->state == ST_PLAY || m->state == ST_REC || m->bouncing);
+    if (m->ui_dirty || (animating && (now_ms - m->last_draw_ms >= UI_FRAME_MS))) {
+        m->ui_dirty = false;
+        m->last_draw_ms = now_ms;
+        return true;
+    }
+
+    return false;
 }
 
 /* ----------------------------------------------------------------------------
- * Input Handler
+ * Input & Resume Handlers
  * ------------------------------------------------------------------------- */
+static void pm_on_resume(os_app_t* app) {
+    pm_model_t* m = (pm_model_t*)os_app_get_model(app);
+    if (!m) return;
+    pm_sync_monitor(m);
+    pm_sync_engine_active(m);
+    m->ui_dirty = true;
+}
+
 static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
     if (btn == BTN_ENCODER) return;
@@ -1437,7 +1519,7 @@ static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
 
     if (st == KEY_STATE_RELEASED && btn == BTN2 && m->rec_btn_down) {
         m->rec_btn_down = false;
-        m->rec_holdoff_fr = MIC_START_SETTLE_FR;
+        m->rec_holdoff_fr = MIC_START_SETTLE_FR24;
         return;
     }
 
@@ -1471,6 +1553,7 @@ static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
                 m->buf_locked = true;
                 m->rec_frames = 0u;
                 m->rec_done_req = false;
+                m->mon_arm_req = false;
                 m->rec_manual_stop = false;
                 m->rec_held_fr = 0u;
                 m->rec_hp_xl = m->rec_hp_yl = 0.0f;
@@ -1478,7 +1561,7 @@ static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
                 m->in_src = os_audio_get_input();
                 if (m->in_src == 1u) {
                     m->rec_btn_down = true;
-                    m->rec_holdoff_fr = MIC_START_SETTLE_FR;
+                    m->rec_holdoff_fr = MIC_START_SETTLE_FR24;
                 } else {
                     m->rec_btn_down = false;
                     m->rec_holdoff_fr = 0u;
@@ -1508,6 +1591,7 @@ static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
             break;
         }
 
+        m->ui_dirty = true;
         m->hint_state = m->state;
         m->hint_mode = m->mode;
         m->hint_bounce = m->bouncing;
@@ -1535,12 +1619,14 @@ static bool pm_app_init(os_app_t* app) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
 
     /*
-     * 1. Allocate hot 21 KB acoustic workspace, tape staging buffer, DMA window
-     *    handle, and UI menu FIRST so hot audio state gets priority for internal
-     *    RAM and OS UI/menu allocations never starve.
+     * 1. Allocate compact 11.5 KB hot acoustic workspace FIRST so it lands in
+     *    fast internal SRAM and stays 100% resident in 16 KB L1 D-Cache.
      */
     m->space = (pend_space_t*)os_malloc(sizeof(pend_space_t));
-    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
+    if (!m->space) {
+        return false;
+    }
+    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR48 * 2u * sizeof(float));
 
     tape_t* t = tape_get();
     if (t) {
@@ -1555,17 +1641,16 @@ static bool pm_app_init(os_app_t* app) {
     }
 
     /*
-     * 2. Allocate PSRAM for 4 custom recording/take slots (3s -> 2s -> 1s each),
-     *    enforcing >= 256 KB of free OS heap afterward so system menus, animated
-     *    .tapp icons, and toasts always have ample RAM.
+     * 2. Allocate PSRAM for 4 custom 24 kHz recording/take slots (4s -> 3s -> 2s each),
+     *    enforcing >= 512 KB of free OS heap afterward so menus/icons/toasts never starve.
      */
-    static const uint32_t kCandSecs[] = { 3u, 2u, 1u };
+    static const uint32_t kCandSecs[] = { 4u, 3u, 2u, 1u };
     for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t per_slot = kCandSecs[c] * TAPP_SAMPLE_RATE;
+        const uint32_t per_slot = kCandSecs[c] * PM_INTERNAL_SR;
         const size_t bytes = (size_t)per_slot * PM_NUM_MICS * sizeof(pm_frame_t);
         pm_frame_t* mem = (pm_frame_t*)os_malloc(bytes);
         if (!mem) continue;
-        void* heap_guard = os_malloc(256u * 1024u);
+        void* heap_guard = os_malloc(512u * 1024u);
         if (heap_guard) {
             os_free(heap_guard);
             m->slots_mem = mem;
@@ -1578,8 +1663,8 @@ static bool pm_app_init(os_app_t* app) {
         os_free(mem);
     }
 
-    /* 3. Initialize Reich 4-pendulum coupled acoustic feedback DSP & instant bank */
-    pm_dsp_init(&m->dsp, (float)TAPP_SAMPLE_RATE);
+    /* 3. Initialize 24 kHz Reich 4-pendulum coupled acoustic feedback DSP */
+    pm_dsp_init(&m->dsp, (float)PM_INTERNAL_SR);
     pm_dsp_attach_space(&m->dsp, m->space);
 
     m->mode = PM_MODE_FEEDBACK;
@@ -1587,6 +1672,12 @@ static bool pm_app_init(os_app_t* app) {
     m->rec_slot = 0u;
     m->bank_idx = PM_BANK_ORGANS;
     pm_do_seed_bank(m, false);
+
+    /* Invalidate cached UI strings so first redraw populates them */
+    m->cached_phi_pc = -32767;
+    for (uint8_t idx = 0u; idx < ENC_TOTAL; ++idx) {
+        m->cached_prm_pc[idx] = -32767;
+    }
 
     /* 4 live encoder cards: GAIN, COUPLE, SPREAD, DECAY */
     m->prm[ENC_GAIN]   = (params_t)PARAM_RANGE("GAIN",   0.58f, 0.00f, 1.00f, 0.02f);
@@ -1626,7 +1717,6 @@ static bool pm_app_init(os_app_t* app) {
         tape_timeline_zoom_out();
     }
 
-    /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
     m->in_src = os_audio_get_input();
     m->mon_saved = os_audio_get_monitor();
     m->wet_saved = os_audio_get_wet();
@@ -1640,6 +1730,7 @@ static bool pm_app_init(os_app_t* app) {
     m->hint_state = m->state;
     m->hint_mode = m->mode;
     m->hint_bounce = m->bouncing;
+    m->ui_dirty = true;
     pm_hints(m);
 
     os_led_set_pattern(&pm_led_pattern, m);
@@ -1651,7 +1742,6 @@ static void pm_app_deinit(os_app_t* app) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
     if (!m) return;
 
-    /* Restore user's WET and live-input monitor preferences on exit */
     (void)os_audio_set_wet(m->wet_saved);
     (void)os_audio_set_monitor(m->mon_saved);
 
@@ -1691,4 +1781,5 @@ TAPP_APP("Pendulum Music", pm_model_t, pm_app_init, pm_app_deinit,
          .redraw = pm_redraw,
          .tick = pm_tick,
          .on_input = pm_input,
+         .on_resume = pm_on_resume,
          .engine_cb = &pm_engine_cb);

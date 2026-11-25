@@ -7,44 +7,49 @@
 /*
  * reich_pendulum_dsp.h — Steve Reich 1968 "Pendulum Music" Coupled Feedback Engine
  *
- * Physically grounded, L1-cache-resident 48 kHz float32 simulation of 4 suspended
- * microphones (i = 0..3) swinging on staggered overhead cables above 4 upward-facing
- * floor speakers (j = 0..3) in a shared gallery space:
- *   1. Symplectic Velocity-Verlet nonlinear pendulum kinematics (1.5 kHz sub-rate):
+ * Ultra-lightweight, SRAM/L1-cache-resident 24 kHz internal float32 simulation
+ * (upsampled to 48 kHz via firmware `ups2x_f32_add`) of 4 suspended microphones
+ * (i = 0..3) swinging on staggered overhead cables above 4 upward-facing floor
+ * speakers (j = 0..3) in a shared gallery space:
+ *   1. Symplectic Velocity-Verlet nonlinear pendulum kinematics (750 Hz control
+ *      sub-rate, every 32 samples at 24 kHz):
  *        d2_theta_i/dt^2 = -(g / L_i) * sin(theta_i) - gamma * d_theta_i/dt
  *      capturing amplitude-dependent period dispersion, cable-length phasing (SPREAD),
  *      perpetual vs gradual decay into a resting 4-voice feedback chord (DECAY),
  *      Unison/Staggered Pull & Release, and the 1968 "Pull Power Plug" ending.
- *   2. Full 4x4 speaker-to-microphone 3D Euclidean acoustic propagation matrix
- *      (4-point Hermite cubic on self-feedback paths, linear on cross-bleed paths,
- *      inside a compact 21 KB workspace whose active window fits inside STM32H7
- *      16 KB L1 D-Cache), producing Barkhausen/Doppler pitch sweeps, constructive
- *      in-phase surges, and destructive out-of-phase cancellation (COUPLE).
- *   3. Warm 1968 PA preamp + 2-mode Cytomic ZDF SVF speaker/cabinet voicings with
- *      zero-division C1 cubic soft saturation and internal DC blocking.
- *   4. Per-mic post-interference feedback envelope followers env[0..3] in [0, 1]
- *      driving Mode 2 ("SOUND VCA") with zero-RAM-traffic real-time register
- *      synthesis for 4 built-in sound banks + custom per-slot recorded/loaded loops.
- *
- * Strictly single-precision float32 & 32-bit integer arithmetic (zero doubles,
- * zero 64-bit integer divisions, zero audio-rate libm calls).
+ *   2. Frame-interleaved 4x4 speaker-to-microphone 3D Euclidean acoustic propagation
+ *      matrix (`pm_quad_t spk_ring[512]`, 8 KB total — zero 4 KB L1 D-Cache way
+ *      aliasing!), with 4-point Hermite cubic self-paths and linear cross-bleed paths.
+ *   3. Single-pass block renderer (`pm_dsp_render_block24`) fusing Mode 1 ("1:FEEDBACK")
+ *      and Mode 2 ("2:SOUND VCA") in registers with zero per-sample cross-TU calls,
+ *      zero denormal-check pipeline stalls, and zero audio-rate libm calls.
  */
 
 #define PM_NUM_MICS        4u
+#define PM_INTERNAL_SR     24000u
 
-#define PM_SPK_DELAY_LEN   1024u
+/* 24 kHz delay lengths (21.3 ms speaker air path = >7.3 m; 10.7 ms gallery room) */
+#define PM_SPK_DELAY_LEN   512u
 #define PM_SPK_DELAY_MASK  (PM_SPK_DELAY_LEN - 1u)
 
-#define PM_ROOM_LEN        512u
+#define PM_ROOM_LEN        256u
 #define PM_ROOM_MASK       (PM_ROOM_LEN - 1u)
 
-#define PM_AP_LEN          128u
+#define PM_AP_LEN          64u
 #define PM_AP_MASK         (PM_AP_LEN - 1u)
+
+/* Max interleaved float32 samples per 24 kHz render chunk (128 stereo 24k frames = 256 stereo 48k frames) */
+#define PM_SCRATCH24       256u
 
 typedef struct {
     float l;
     float r;
 } pm_frame_t;
+
+/* 16-byte frame-interleaved speaker quad: all 4 speakers share a single 32-byte L1 cache line */
+typedef struct {
+    float ch[PM_NUM_MICS];
+} pm_quad_t;
 
 enum {
     PM_TUNING_FIFTHS = 0,   /* Gallery Fifths: G3 - D4 - A4 - D5 open Reich fifths */
@@ -62,16 +67,26 @@ enum {
 };
 
 /*
- * Compact delay & gallery reflection workspace (21,504 bytes = 21.0 KB;
- * active delay window < 13 KB so it stays 100% resident in 16 KB L1 D-Cache).
+ * Compact 11.5 KB SRAM/L1-cache-resident acoustic workspace (11,776 bytes total).
+ * Fits comfortably inside STM32H7 16 KB L1 D-Cache with zero set-conflict thrashing.
  */
 typedef struct {
-    float spk_line[PM_NUM_MICS][PM_SPK_DELAY_LEN];  /* 4 * 1024 floats = 16 KB */
-    float room_l[PM_ROOM_LEN];                      /* 512 floats      =  2 KB */
-    float room_r[PM_ROOM_LEN];                      /* 512 floats      =  2 KB */
-    float ap_l[PM_AP_LEN];                          /* 128 floats      = 0.5KB */
-    float ap_r[PM_AP_LEN];                          /* 128 floats      = 0.5KB */
+    pm_quad_t spk_ring[PM_SPK_DELAY_LEN];   /* 512 * 16 B = 8,192 B (8.0 KB) */
+    float     room_l[PM_ROOM_LEN];          /* 256 *  4 B = 1,024 B (1.0 KB) */
+    float     room_r[PM_ROOM_LEN];          /* 256 *  4 B = 1,024 B (1.0 KB) */
+    float     ap_l[PM_AP_LEN];              /*  64 *  4 B =   256 B          */
+    float     ap_r[PM_AP_LEN];              /*  64 *  4 B =   256 B          */
+    float     scratch24[PM_SCRATCH24];      /* 256 *  4 B = 1,024 B (1.0 KB) */
 } pend_space_t;
+
+/* Compact active cross-speaker coupling tap prepared at 750 Hz control rate */
+typedef struct {
+    uint8_t mic_dst;
+    uint8_t spk_src;
+    float   gain;
+    float   del_cur;
+    float   del_inc;
+} pm_cross_tap_t;
 
 typedef struct {
     float sample_rate;
@@ -87,61 +102,57 @@ typedef struct {
     uint8_t bank_idx;
     bool    release_stagger;
     bool    plug_pulled;
-    uint8_t phys_sub;
+    uint8_t phys_rem;
 
     /* PA power supply rail [0..1] */
     float pa_power;
     float pa_power_tgt;
 
-    /* Per-pendulum nonlinear kinematics & 3D capsule geometry */
+    /* Per-pendulum nonlinear kinematics & cached reciprocals */
     float theta[PM_NUM_MICS];
     float omega[PM_NUM_MICS];
     float cable_len[PM_NUM_MICS];
     float cable_tgt[PM_NUM_MICS];
+    float inv_cable[PM_NUM_MICS];
+    float inv_w0[PM_NUM_MICS];
     float px[PM_NUM_MICS];
     float pz[PM_NUM_MICS];
     float deg[PM_NUM_MICS];
     float norm_u[PM_NUM_MICS];
     float norm_v[PM_NUM_MICS];
 
-    /* Precomputed Mode 2 constant-power stereo pan gains (updated at 1.5 kHz) */
+    /* Precomputed Mode 2 constant-power stereo pan gains (updated at 750 Hz) */
     float vca_pan_l[PM_NUM_MICS];
     float vca_pan_r[PM_NUM_MICS];
 
-    /* 4x4 acoustic propagation delays (samples) & cross-coupling gains */
-    float del_tgt[PM_NUM_MICS][PM_NUM_MICS];
-    float del_cur[PM_NUM_MICS][PM_NUM_MICS];
-    float cpl_tgt[PM_NUM_MICS][PM_NUM_MICS];
-    float cpl_cur[PM_NUM_MICS][PM_NUM_MICS];
-    float self_gain_tgt[PM_NUM_MICS];
+    /* Self-path delays & gains with precomputed linear sub-block increments */
+    float self_del_cur[PM_NUM_MICS];
+    float self_del_tgt[PM_NUM_MICS];
+    float self_del_inc[PM_NUM_MICS];
+
     float self_gain_cur[PM_NUM_MICS];
-    float loop_gain_tgt[PM_NUM_MICS];
+    float self_gain_tgt[PM_NUM_MICS];
+    float self_gain_inc[PM_NUM_MICS];
+
     float loop_gain_cur[PM_NUM_MICS];
+    float loop_gain_tgt[PM_NUM_MICS];
+    float loop_gain_inc[PM_NUM_MICS];
 
-    /* Per-channel PA speaker passband, 2-mode ZDF SVF body & DC blocker */
-    float hp_x[PM_NUM_MICS];
-    float hp_y[PM_NUM_MICS];
+    /* Cross-speaker propagation delays & active sparse tap list (<= 12 pairs) */
+    float          cross_del_cur[PM_NUM_MICS][PM_NUM_MICS];
+    pm_cross_tap_t cross_taps[12];
+    uint8_t        num_cross_taps;
+
+    /* Per-channel PA cabinet LPF + resonant ZDF Bandpass SVF (zero DC gain) */
     float lp_y[PM_NUM_MICS];
-    float svf1_g[PM_NUM_MICS];
-    float svf1_k[PM_NUM_MICS];
-    float svf1_a1[PM_NUM_MICS];
-    float svf1_a2[PM_NUM_MICS];
-    float svf1_a3[PM_NUM_MICS];
-    float svf1_ic1[PM_NUM_MICS];
-    float svf1_ic2[PM_NUM_MICS];
-
-    float svf2_g;
-    float svf2_k;
-    float svf2_a1;
-    float svf2_a2;
-    float svf2_a3;
-    float svf2_ic1[PM_NUM_MICS];
-    float svf2_ic2[PM_NUM_MICS];
-
+    float svf_g[PM_NUM_MICS];
+    float svf_k_gain[PM_NUM_MICS];
+    float svf_a1[PM_NUM_MICS];
+    float svf_a2[PM_NUM_MICS];
+    float svf_a3[PM_NUM_MICS];
+    float svf_ic1[PM_NUM_MICS];
+    float svf_ic2[PM_NUM_MICS];
     float tau_trim[PM_NUM_MICS];
-    float dc_r;
-    float dc_x[PM_NUM_MICS];
-    float dc_y[PM_NUM_MICS];
     float last_spk[PM_NUM_MICS];
 
     /* Per-mic feedback level followers & anti-zipper VCA gains [0..1] */
@@ -166,6 +177,7 @@ typedef struct {
     uint32_t ap_wr;
     float room_lp_l;
     float room_lp_r;
+    float dc_r;
     float out_dc_xl;
     float out_dc_yl;
     float out_dc_xr;
@@ -199,14 +211,26 @@ const char* pm_bank_slot_tag(uint8_t bank_idx, uint8_t slot_idx);
 float pm_clip_guard(float x);
 float pm_soft_limit(float x);
 
+/* Single-sample helpers retained for host unit tests & inspection */
 void pm_dsp_step(reich_pendulum_dsp_t* d, pm_frame_t* out_fbk);
-
-/*
- * Render Mode 2 ("SOUND VCA"):
- * For each mic i = 0..3, if bit `i` of `custom_mask` is set and `custom_in` is non-NULL,
- * uses `custom_in[i]` (recorded/loaded audio); otherwise synthesizes the active built-in
- * sound bank voice in registers with zero PSRAM traffic.
- */
 pm_frame_t pm_render_sound_vca(reich_pendulum_dsp_t* d,
                                const pm_frame_t custom_in[PM_NUM_MICS],
                                uint8_t custom_mask);
+
+/*
+ * Fast block-fused 24 kHz renderer: processes `frames24` stereo frames into
+ * interleaved `out24[0 .. 2*frames24 - 1]` in a single call per block.
+ */
+void pm_dsp_render_block24(reich_pendulum_dsp_t* restrict d,
+                           float* restrict out24,
+                           uint32_t frames24,
+                           float play_target,
+                           float play_step,
+                           float* restrict io_play_gain,
+                           float mode_target,
+                           float mode_step,
+                           float* restrict io_mode_mix,
+                           pm_frame_t* const slot_buf[PM_NUM_MICS],
+                           const volatile uint32_t slot_len[PM_NUM_MICS],
+                           volatile uint32_t head_io[PM_NUM_MICS],
+                           uint8_t custom_mask);
