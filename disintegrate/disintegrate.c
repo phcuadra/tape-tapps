@@ -1196,18 +1196,14 @@ static void draw_waveform_stage(gfx_t* gfx, const dis_model_t* m) {
 
     /* Empty state */
     if (m->loop_len < 8u) {
-        /* Subtle twin tape-reel motif */
-        gfx_draw_circle(gfx, 152, WAVE_Y + 34, 15, GFX_DRAW_ALL);
-        gfx_draw_circle(gfx, 152, WAVE_Y + 34, 5, GFX_DRAW_ALL);
-        gfx_draw_circle(gfx, 248, WAVE_Y + 34, 15, GFX_DRAW_ALL);
-        gfx_draw_circle(gfx, 248, WAVE_Y + 34, 5, GFX_DRAW_ALL);
-        gfx_draw_hline_dithered(gfx, 152, WAVE_Y + 19, 96, 3);
-        gfx_draw_hline_dithered(gfx, 152, WAVE_Y + 49, 96, 3);
-
-        gfx_set_font(gfx, DepartureMono_Regular_10);
-        const char* hint = "PRESS REC TO CAPTURE  /  HOLD ERODE FOR TAKES";
-        const int hw = (int)gfx_get_str_width(gfx, hint);
-        gfx_draw_str(gfx, SCREEN_CENTER_X - hw / 2, WAVE_Y + WAVE_H - 10, hint);
+        /* Subtle twin tape-reel motif centered vertically in WAVE_H (82px) */
+        const int cy = WAVE_Y + WAVE_H / 2;
+        gfx_draw_circle(gfx, 152, cy, 15, GFX_DRAW_ALL);
+        gfx_draw_circle(gfx, 152, cy, 5, GFX_DRAW_ALL);
+        gfx_draw_circle(gfx, 248, cy, 15, GFX_DRAW_ALL);
+        gfx_draw_circle(gfx, 248, cy, 5, GFX_DRAW_ALL);
+        gfx_draw_hline_dithered(gfx, 152, cy - 15, 96, 3);
+        gfx_draw_hline_dithered(gfx, 152, cy + 15, 96, 3);
         return;
     }
 
