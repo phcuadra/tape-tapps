@@ -4,7 +4,7 @@ A standalone *tape!* application (`AppTypeStandalone`) inspired by William Basin
 
 ## Architecture & DSP
 
-- **RAM Loop Buffer + Clean Q15 Backup Snapshot**: Allocates up to 16 seconds of stereo 48 kHz float audio (plus a matching Q15 stereo backup snapshot, with automatic fallback down to 2 s if heap is tighter) via `os_malloc()` in PSRAM while keeping the app model small (~3 KB in internal RAM).
+- **Packed Q2.14 RAM Loop + Zero-RAM SD/Tape Restore**: Stores stereo 48 kHz audio as 32-bit-aligned packed Q2.14 frames (`4 B/frame` = `192 KB/s`, ±1.20 full-scale headroom, unbiased stochastic rounding on erosion) with 1-second allocation granularity (`8–10 s` on *tape!* hardware PSRAM, `16 s` on the web emulator). Clean fresh-loop snapshots spill to app-private SD storage (`/fresh_loop.bin`) or re-read directly from the source tape span with zero RAM backup overhead.
 - **Destructive Per-Sample Oxide Erosion** (`disintegrate_dsp.c` / `inc/disintegrate_dsp.h`):
   1. **Spatially persistent C1-periodic oxide flaking field**: Dual-octave smoothstep 1D value noise (`coarse` + `2.73x` fine detail) with C1 seam blending across loop wraparound, slow boundary creep (`drift_phase` / `detail_phase`), and character-controlled stereo track linking.
   2. **Progressive high-frequency dulling**: Zero-phase convex stride-1 + stride-3 waveform diffusion weighted by local flake intensity and `WEAR`.

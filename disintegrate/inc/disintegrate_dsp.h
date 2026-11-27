@@ -11,10 +11,42 @@
  * adapted for tape! (ARM Cortex-M7, single-precision float32 only).
  */
 
-typedef struct {
-    float l;
-    float r;
+/*
+ * 4-byte 32-bit-aligned packed stereo frame (192 KB/sec at 48 kHz — 3x smaller
+ * than float32 + Q15 backup, enabling 8–10s loops in *tape!* hardware PSRAM).
+ * Full scale is ±1.2000f (+1.58 dBFS analog headroom matching dis_soft_clip_guard),
+ * accessed strictly as 32-bit words so OCTOSPI PSRAM never sees halfword accesses.
+ */
+#define DIS_Q_SCALE     27306.0f
+#define DIS_Q_INV       (1.0f / 27306.0f)
+
+typedef struct __attribute__((aligned(4))) {
+    uint32_t lr;    /* low 16 bits: int16_t L, high 16 bits: int16_t R */
 } dis_frame_t;
+
+static inline int16_t dis_f32_to_q(float x) {
+    if (x >  1.2f) x =  1.2f;
+    if (x < -1.2f) x = -1.2f;
+    const float s = x * DIS_Q_SCALE;
+    int32_t q = (int32_t)(s >= 0.0f ? (s + 0.5f) : (s - 0.5f));
+    if (q >  32767) q =  32767;
+    if (q < -32767) q = -32767;
+    return (int16_t)q;
+}
+
+static inline dis_frame_t dis_frame_pack(float l, float r) {
+    const uint16_t ul = (uint16_t)dis_f32_to_q(l);
+    const uint16_t ur = (uint16_t)dis_f32_to_q(r);
+    dis_frame_t f = { (uint32_t)ul | ((uint32_t)ur << 16) };
+    return f;
+}
+
+static inline void dis_frame_unpack(dis_frame_t f, float* out_l, float* out_r) {
+    const int16_t ql = (int16_t)(uint16_t)(f.lr & 0xFFFFu);
+    const int16_t qr = (int16_t)(uint16_t)(f.lr >> 16);
+    *out_l = (float)ql * DIS_Q_INV;
+    *out_r = (float)qr * DIS_Q_INV;
+}
 
 typedef struct {
     float sample_rate;

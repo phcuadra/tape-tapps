@@ -190,8 +190,8 @@ void dis_erode_frame(dis_engine_t* d, dis_frame_t* buf, uint32_t rec_size,
 
     d->activity += 0.002f * (0.5f * (flake_l + flake_r) - d->activity);
 
-    float xl = buf[i0].l;
-    float xr = buf[i0].r;
+    float xl = 0.0f, xr = 0.0f;
+    dis_frame_unpack(buf[i0], &xl, &xr);
 
     /* 2. Progressive High-Frequency Dulling (zero-phase convex stride-1 + stride-3 waveform diffusion) */
     const int32_t im1 = (i0 == 0) ? (size - 1) : (i0 - 1);
@@ -205,12 +205,19 @@ void dis_erode_frame(dis_engine_t* d, dis_frame_t* buf, uint32_t rec_size,
     const float kappa_l = dis_fast_clamp(wear_base * (0.75f + 1.45f * flake_l), 0.0f, 0.48f);
     const float kappa_r = dis_fast_clamp(wear_base * (0.75f + 1.45f * flake_r), 0.0f, 0.48f);
 
-    const float lap1_l = 0.5f * (buf[im1].l + buf[ip1].l) - xl;
-    const float lap3_l = 0.5f * (buf[im3].l + buf[ip3].l) - xl;
+    float m1_l = 0.0f, m1_r = 0.0f, p1_l = 0.0f, p1_r = 0.0f;
+    float m3_l = 0.0f, m3_r = 0.0f, p3_l = 0.0f, p3_r = 0.0f;
+    dis_frame_unpack(buf[im1], &m1_l, &m1_r);
+    dis_frame_unpack(buf[ip1], &p1_l, &p1_r);
+    dis_frame_unpack(buf[im3], &m3_l, &m3_r);
+    dis_frame_unpack(buf[ip3], &p3_l, &p3_r);
+
+    const float lap1_l = 0.5f * (m1_l + p1_l) - xl;
+    const float lap3_l = 0.5f * (m3_l + p3_l) - xl;
     xl += kappa_l * (0.65f * lap1_l + 0.35f * lap3_l * d->mix);
 
-    const float lap1_r = 0.5f * (buf[im1].r + buf[ip1].r) - xr;
-    const float lap3_r = 0.5f * (buf[im3].r + buf[ip3].r) - xr;
+    const float lap1_r = 0.5f * (m1_r + p1_r) - xr;
+    const float lap3_r = 0.5f * (m3_r + p3_r) - xr;
     xr += kappa_r * (0.65f * lap1_r + 0.35f * lap3_r * d->mix);
 
     /* 3. Oxide Dropouts / Flaking (damaged/thinned regions shed oxide slightly faster) */
@@ -251,9 +258,30 @@ void dis_erode_frame(dis_engine_t* d, dis_frame_t* buf, uint32_t rec_size,
         }
     }
 
-    /* Flush sub-audible tails cleanly to pure silence (prevents Cortex-M7 denormals & residual hiss) */
-    buf[i0].l = (fabsf(xl) < DIS_SILENCE_FLOOR) ? 0.0f : dis_soft_clip_guard(xl);
-    buf[i0].r = (fabsf(xr) < DIS_SILENCE_FLOOR) ? 0.0f : dis_soft_clip_guard(xr);
+    /*
+     * 6. Flush sub-audible tails to exact zero, then write back with unbiased
+     *    stochastic rounding: `floorf(y + U)` with `U in [0, 1)` preserves exact
+     *    sub-LSB decay down to 0 (zero limit-cycle hang at low RATE) while mapping
+     *    exact 0.0f -> 0 with probability 1.0 (zero hiss buildup in silent spans).
+     */
+    xl = (fabsf(xl) < DIS_SILENCE_FLOOR) ? 0.0f : dis_soft_clip_guard(xl);
+    xr = (fabsf(xr) < DIS_SILENCE_FLOOR) ? 0.0f : dis_soft_clip_guard(xr);
+
+    int32_t ql = 0;
+    int32_t qr = 0;
+    if (xl != 0.0f) {
+        const float ul01 = (float)(dis_next_u32(d) >> 8) * (1.0f / 16777216.0f);
+        ql = (int32_t)floorf(xl * DIS_Q_SCALE + ul01);
+        if (ql >  32767) ql =  32767;
+        if (ql < -32767) ql = -32767;
+    }
+    if (xr != 0.0f) {
+        const float ur01 = (float)(dis_next_u32(d) >> 8) * (1.0f / 16777216.0f);
+        qr = (int32_t)floorf(xr * DIS_Q_SCALE + ur01);
+        if (qr >  32767) qr =  32767;
+        if (qr < -32767) qr = -32767;
+    }
+    buf[i0].lr = (uint32_t)(uint16_t)(int16_t)ql | ((uint32_t)(uint16_t)(int16_t)qr << 16);
 }
 
 void dis_step_erode(dis_engine_t* d, dis_frame_t* buf, uint32_t rec_size,

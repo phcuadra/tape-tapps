@@ -67,6 +67,14 @@ enum {
     ENC_TOTAL,
 };
 
+#define DIS_BACKUP_PATH  "/fresh_loop.bin"
+
+enum {
+    BACKUP_NONE = 0,
+    BACKUP_STORAGE_FILE,
+    BACKUP_TAPE_SPAN,
+};
+
 /* ----------------------------------------------------------------------------
  * Model (kept small in internal RAM; audio buffers live in os_malloc / PSRAM)
  * ------------------------------------------------------------------------- */
@@ -84,14 +92,16 @@ typedef struct {
     /* Audio engine active flag */
     volatile bool     eng_active;
 
-    /* RAM loop buffer (PSRAM via os_malloc) */
+    /* RAM loop buffer (4 B/frame aligned 32-bit stereo Q2.14 in PSRAM via os_malloc) */
     dis_frame_t*      loop_buf;
-    int16_t*          backup_buf;     /* interleaved Q15 L/R pristine snapshot */
     float*            read_stage;     /* LOAD_CHUNK_FR * 2 floats for tape_read */
     uint32_t          max_frames;     /* allocated capacity in stereo frames */
     volatile uint32_t loop_len;       /* active loop length in stereo frames */
     uint32_t          backup_len;
-    bool              has_backup;
+    uint32_t          backup_src_frame;
+    uint8_t           backup_mode;    /* BACKUP_NONE / BACKUP_STORAGE_FILE / BACKUP_TAPE_SPAN */
+    bool              load_is_restore;
+    uint8_t           restore_prev_state;
 
     /* Live capture & button-click pop suppression state */
     volatile uint32_t rec_frames;
@@ -193,12 +203,6 @@ static void dis_sync_monitor(dis_model_t* m);
 /* ----------------------------------------------------------------------------
  * Small helpers (f32 only)
  * ------------------------------------------------------------------------- */
-static inline int16_t f32_to_q15(float x) {
-    float c = clampf(x, -1.0f, 1.0f);
-    float s = c * 32767.0f;
-    return (int16_t)(s >= 0.0f ? (s + 0.5f) : (s - 0.5f));
-}
-
 static inline uint32_t vis_rand(dis_model_t* m) {
     uint32_t x = m->vis_rng;
     x ^= x << 13;
@@ -218,27 +222,20 @@ static void apply_loop_splice(dis_frame_t* buf, uint32_t len) {
     for (uint32_t i = 0; i < fade; ++i) {
         const float t = (float)i * inv;
         const float w = t * t * (3.0f - 2.0f * t); /* smoothstep */
-        buf[i].l *= w;
-        buf[i].r *= w;
+        float hl = 0.0f, hr = 0.0f;
+        dis_frame_unpack(buf[i], &hl, &hr);
+        buf[i] = dis_frame_pack(hl * w, hr * w);
+
         const uint32_t tail = len - 1u - i;
-        buf[tail].l *= w;
-        buf[tail].r *= w;
+        float tl = 0.0f, tr = 0.0f;
+        dis_frame_unpack(buf[tail], &tl, &tr);
+        buf[tail] = dis_frame_pack(tl * w, tr * w);
     }
 }
 
-static void save_backup_and_waves(dis_model_t* m) {
+static void build_waves_and_rms(dis_model_t* m) {
     const uint32_t len = m->loop_len;
     if (!m->loop_buf || len < 8u) return;
-
-    /* Copy pristine audio into Q15 backup buffer if allocated */
-    if (m->backup_buf) {
-        for (uint32_t i = 0; i < len; ++i) {
-            m->backup_buf[i * 2u]      = f32_to_q15(m->loop_buf[i].l);
-            m->backup_buf[i * 2u + 1u] = f32_to_q15(m->loop_buf[i].r);
-        }
-        m->backup_len = len;
-        m->has_backup = true;
-    }
 
     /* Build initial waveform envelope & reference RMS */
     float energy = 0.0f;
@@ -254,8 +251,10 @@ static void save_backup_and_waves(dis_model_t* m) {
 
         float pk = 0.0f;
         for (uint32_t i = f0; i < f1; i += step) {
-            const float al = fabsf(m->loop_buf[i].l);
-            const float ar = fabsf(m->loop_buf[i].r);
+            float sl = 0.0f, sr = 0.0f;
+            dis_frame_unpack(m->loop_buf[i], &sl, &sr);
+            const float al = fabsf(sl);
+            const float ar = fabsf(sr);
             const float a = (al > ar) ? al : ar;
             if (a > pk) pk = a;
             energy += 0.5f * (al * al + ar * ar);
@@ -519,8 +518,8 @@ static void dis_process(void* restrict ctx, mixer_t* restrict mix) {
                         const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR);
                         fg = t * t * (3.0f - 2.0f * t);
                     }
-                    lbuf[rf].l = dis_soft_clip_guard(il * fg);
-                    lbuf[rf].r = dis_soft_clip_guard(ir * fg);
+                    lbuf[rf] = dis_frame_pack(dis_soft_clip_guard(il * fg),
+                                              dis_soft_clip_guard(ir * fg));
                     m->rec_frames = rf + 1u;
                     if (m->rec_frames >= m->max_frames) {
                         m->rec_done_req = true;
@@ -562,11 +561,12 @@ static void dis_process(void* restrict ctx, mixer_t* restrict mix) {
                 const int32_t i1 = (i0 + 1 < size) ? (i0 + 1) : 0;
                 const float frac = m->head_f;
 
-                /* Linearly interpolated stereo playback */
-                float sl = lbuf[i0].l + frac * (lbuf[i1].l - lbuf[i0].l);
-                float sr = lbuf[i0].r + frac * (lbuf[i1].r - lbuf[i0].r);
-                sl = dis_soft_clip_guard(sl);
-                sr = dis_soft_clip_guard(sr);
+                /* Linearly interpolated stereo playback from 32-bit packed frames */
+                float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
+                dis_frame_unpack(lbuf[i0], &l0, &r0);
+                dis_frame_unpack(lbuf[i1], &l1, &r1);
+                float sl = dis_soft_clip_guard(l0 + frac * (l1 - l0));
+                float sr = dis_soft_clip_guard(r0 + frac * (r1 - r0));
 
                 ol = sl * pg;
                 orr = sr * pg;
@@ -766,7 +766,17 @@ static void dis_finish_capture(dis_model_t* m) {
     m->play_gain = 0.0f;
 
     dis_reset_tape(&m->dsp);
-    save_backup_and_waves(m);
+    build_waves_and_rms(m);
+
+    /* Spill pristine capture to app-private SD storage (zero RAM backup overhead) */
+    const size_t bytes = (size_t)captured * sizeof(dis_frame_t);
+    if (storage_write_file(DIS_BACKUP_PATH, m->loop_buf, bytes) > 0u) {
+        m->backup_mode = BACKUP_STORAGE_FILE;
+        m->backup_len = captured;
+    } else {
+        m->backup_mode = BACKUP_NONE;
+        m->backup_len = 0u;
+    }
 
     m->state = ST_PLAY;
     m->buf_locked = false;
@@ -775,20 +785,7 @@ static void dis_finish_capture(dis_model_t* m) {
     dis_hints(m);
 }
 
-static void dis_do_restore(dis_model_t* m) {
-    if (!m->has_backup || !m->backup_buf || !m->loop_buf || m->backup_len < 8u) {
-        ui_notify_toast(NotifyWarning, "No backup to restore", 1800u);
-        return;
-    }
-
-    m->buf_locked = true;
-    const uint32_t len = m->backup_len;
-    const float inv = 1.0f / 32767.0f;
-    for (uint32_t i = 0; i < len; ++i) {
-        m->loop_buf[i].l = (float)m->backup_buf[i * 2u] * inv;
-        m->loop_buf[i].r = (float)m->backup_buf[i * 2u + 1u] * inv;
-    }
-
+static void dis_reset_restored_state(dis_model_t* m, uint32_t len) {
     m->loop_len = len;
     m->head_i = 0;
     m->head_f = 0.0f;
@@ -805,7 +802,44 @@ static void dis_do_restore(dis_model_t* m) {
     m->integrity_pct = 100u;
     m->wave_cursor = 0u;
     m->sweep_rms_acc = 0.0f;
+}
 
+static void dis_do_restore(dis_model_t* m) {
+    if (m->backup_mode == BACKUP_NONE || !m->loop_buf || m->backup_len < 8u ||
+        m->backup_len > m->max_frames) {
+        ui_notify_toast(NotifyWarning, "No backup to restore", 1800u);
+        return;
+    }
+
+    const uint32_t len = m->backup_len;
+
+    if (m->backup_mode == BACKUP_TAPE_SPAN) {
+        tape_t* t = tape_get();
+        if (!t || !m->read_stage) {
+            ui_notify_toast(NotifyWarning, "Tape unavailable", 1800u);
+            return;
+        }
+        m->buf_locked = true;
+        m->restore_prev_state = (m->state == ST_PLAY) ? ST_PLAY : ST_STOP;
+        m->load_is_restore = true;
+        m->load_src_frame = m->backup_src_frame;
+        m->load_total = len;
+        m->load_done = 0u;
+        m->state = ST_LOADING;
+        dis_sync_engine_active(m);
+        dis_hints(m);
+        return;
+    }
+
+    m->buf_locked = true;
+    const size_t bytes = (size_t)len * sizeof(dis_frame_t);
+    if (storage_read_file(DIS_BACKUP_PATH, m->loop_buf, bytes) == 0u) {
+        m->buf_locked = false;
+        ui_notify_toast(NotifyError, "Backup read failed", 1800u);
+        return;
+    }
+
+    dis_reset_restored_state(m, len);
     m->buf_locked = false;
     ui_notify_toast(NotifySuccess, "Fresh loop restored", 1800u);
 }
@@ -815,7 +849,8 @@ static void dis_do_clear(dis_model_t* m) {
     m->state = ST_STOP;
     m->loop_len = 0u;
     m->backup_len = 0u;
-    m->has_backup = false;
+    m->backup_mode = BACKUP_NONE;
+    m->load_is_restore = false;
     m->head_i = 0;
     m->head_f = 0.0f;
     m->passes = 0u;
@@ -851,6 +886,7 @@ static void dis_start_take_load(dis_model_t* m, uint32_t take_idx) {
     }
 
     m->buf_locked = true;
+    m->load_is_restore = false;
     m->load_src_frame = s;
     m->load_total = len;
     m->load_done = 0u;
@@ -863,6 +899,7 @@ static void dis_step_take_load(dis_model_t* m) {
     tape_t* t = tape_get();
     if (!t || !m->read_stage || !m->loop_buf) {
         m->state = ST_STOP;
+        m->load_is_restore = false;
         m->buf_locked = false;
         return;
     }
@@ -872,34 +909,51 @@ static void dis_step_take_load(dis_model_t* m) {
     const uint32_t got = tape_read(t, m->load_src_frame + m->load_done, m->read_stage, chunk);
     if (got == 0u) {
         m->state = ST_STOP;
+        m->load_is_restore = false;
         m->buf_locked = false;
         ui_notify_toast(NotifyError, "Tape read failed", 1800u);
         return;
     }
 
     for (uint32_t i = 0; i < got; ++i) {
-        m->loop_buf[m->load_done + i].l = m->read_stage[i * 2u];
-        m->loop_buf[m->load_done + i].r = m->read_stage[i * 2u + 1u];
+        m->loop_buf[m->load_done + i] = dis_frame_pack(
+            dis_soft_clip_guard(m->read_stage[i * 2u]),
+            dis_soft_clip_guard(m->read_stage[i * 2u + 1u]));
     }
     m->load_done += got;
 
     if (m->load_done >= m->load_total) {
         const uint32_t len = m->load_done;
         apply_loop_splice(m->loop_buf, len);
-        m->loop_len = len;
-        m->head_i = 0;
-        m->head_f = 0.0f;
-        m->passes = 0u;
-        m->play_gain = 0.0f;
 
-        dis_reset_tape(&m->dsp);
-        save_backup_and_waves(m);
+        if (m->load_is_restore) {
+            m->load_is_restore = false;
+            dis_reset_restored_state(m, len);
+            m->state = m->restore_prev_state;
+            m->buf_locked = false;
+            dis_sync_engine_active(m);
+            dis_hints(m);
+            ui_notify_toast(NotifySuccess, "Fresh loop restored", 1800u);
+        } else {
+            m->loop_len = len;
+            m->head_i = 0;
+            m->head_f = 0.0f;
+            m->passes = 0u;
+            m->play_gain = 0.0f;
 
-        m->state = ST_PLAY;
-        m->buf_locked = false;
-        dis_sync_engine_active(m);
-        dis_hints(m);
-        ui_notify_toast(NotifySuccess, "Take loaded", 1800u);
+            m->backup_mode = BACKUP_TAPE_SPAN;
+            m->backup_src_frame = m->load_src_frame;
+            m->backup_len = len;
+
+            dis_reset_tape(&m->dsp);
+            build_waves_and_rms(m);
+
+            m->state = ST_PLAY;
+            m->buf_locked = false;
+            dis_sync_engine_active(m);
+            dis_hints(m);
+            ui_notify_toast(NotifySuccess, "Take loaded", 1800u);
+        }
     }
 }
 
@@ -1157,10 +1211,11 @@ static void draw_waveform_stage(gfx_t* gfx, const dis_model_t* m) {
     gfx_set_color(gfx, GFX_COLOR_SET);
     gfx_draw_rect_r(gfx, WAVE_X, WAVE_Y, WAVE_W, WAVE_H, 3);
 
-    /* Loading progress view */
+    /* Loading / restoring progress view */
     if (m->state == ST_LOADING) {
         gfx_set_font(gfx, gfx_nunito_semibold_14);
-        const char* msg = "LOADING TAPE TAKE...";
+        const char* msg = m->load_is_restore ? "RESTORING FRESH LOOP..."
+                                             : "LOADING TAPE TAKE...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
         gfx_draw_str(gfx, SCREEN_CENTER_X - mw / 2, WAVE_Y + 34, msg);
 
@@ -1347,6 +1402,10 @@ static bool dis_tick(os_app_t* app) {
             m->bouncing = false;
             m->bounce_tok = 0u;
         }
+        if (m->backup_mode == BACKUP_TAPE_SPAN) {
+            m->backup_mode = BACKUP_NONE;
+            m->backup_len = 0u;
+        }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
         tape_timeline_set_loop(false);
@@ -1425,8 +1484,10 @@ static bool dis_tick(os_app_t* app) {
             float sq = 0.0f;
             uint32_t cnt = 0u;
             for (uint32_t i = f0; i < f1; i += stride) {
-                const float al = fabsf(m->loop_buf[i].l);
-                const float ar = fabsf(m->loop_buf[i].r);
+                float sl = 0.0f, sr = 0.0f;
+                dis_frame_unpack(m->loop_buf[i], &sl, &sr);
+                const float al = fabsf(sl);
+                const float ar = fabsf(sr);
                 const float a = (al > ar) ? al : ar;
                 if (a > pk) pk = a;
                 sq += 0.5f * (al * al + ar * ar);
@@ -1660,33 +1721,22 @@ static bool dis_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate stereo float RAM loop + Q15 clean backup in a SINGLE combined
-     *    `os_malloc()` call per candidate. The web emulator (`tapp_emu`) uses a
-     *    ~4.19 MB bump allocator where `os_free()` is a no-op, so separate `lb`
-     *    + `bb` or `guard` probes must NEVER partially succeed and strand heap!
-     *    - On 8 MB hardware: 11s (6.34 MB) succeeds, leaving ~700 KB free.
-     *    - On 4.19 MB emulator: 16s/11s/9s return NULL cleanly (0 bytes bumped)
-     *      and 6s (3.46 MB) succeeds on first fit, leaving ~650 KB untouched!
+     * 3. Allocate 4-byte/frame (192 KB/s at 48 kHz) stereo loop buffer with
+     *    1-second granularity and zero RAM backup overhead:
+     *    - On *tape!* hardware (~1.5–2.0 MB free PSRAM): 8s–10s (1.54–1.92 MB) fits!
+     *    - On web emulator (~4.19 MB bump arena): 16s (3.07 MB) fits on first call!
      */
-    static const uint32_t kCandSecs[] = { 16u, 11u, 9u, 6u, 4u, 2u, 1u };
+    static const uint32_t kCandSecs[] = {
+        16u, 14u, 12u, 11u, 10u, 9u, 8u, 7u, 6u, 5u, 4u, 3u, 2u, 1u
+    };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        const size_t lb_bytes = (size_t)frames * sizeof(dis_frame_t);
-        const size_t bb_bytes = (size_t)frames * 2u * sizeof(int16_t);
-        uint8_t* raw = (uint8_t*)os_malloc(lb_bytes + bb_bytes);
-        if (raw) {
-            m->loop_buf = (dis_frame_t*)raw;
-            m->backup_buf = (int16_t*)(raw + lb_bytes);
+        dis_frame_t* lb = (dis_frame_t*)os_malloc((size_t)frames * sizeof(dis_frame_t));
+        if (lb) {
+            m->loop_buf = lb;
             m->max_frames = frames;
             break;
-        }
-    }
-    if (!m->loop_buf) {
-        const uint32_t frames = 1u * TAPP_SAMPLE_RATE;
-        m->loop_buf = (dis_frame_t*)os_malloc((size_t)frames * sizeof(dis_frame_t));
-        if (m->loop_buf) {
-            m->max_frames = frames;
         }
     }
 
@@ -1741,6 +1791,12 @@ static void dis_app_deinit(os_app_t* app) {
     tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
+    if (m->backup_mode == BACKUP_STORAGE_FILE) {
+        (void)storage_delete_file(DIS_BACKUP_PATH);
+        (void)storage_delete_file(DIS_BACKUP_PATH ".bak");
+        m->backup_mode = BACKUP_NONE;
+    }
+
     if (m->wb) {
         tape_buffer_deinit(m->wb);
         m->wb = NULL;
@@ -1749,8 +1805,6 @@ static void dis_app_deinit(os_app_t* app) {
         os_free(m->read_stage);
         m->read_stage = NULL;
     }
-    /* `backup_buf` aliases the tail of the combined `loop_buf` allocation */
-    m->backup_buf = NULL;
     if (m->loop_buf) {
         os_free(m->loop_buf);
         m->loop_buf = NULL;
