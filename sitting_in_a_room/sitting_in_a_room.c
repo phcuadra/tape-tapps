@@ -1316,32 +1316,29 @@ static void draw_waveform_stage(gfx_t* gfx, const sit_model_t* m) {
 
     /* Empty state: architectural room speaker -> standing wave -> mic diagram */
     if (m->loop_len < 8u) {
+        const int cy = WAVE_Y + 33;
+
         /* Speaker icon on left */
-        gfx_draw_rect_fill(gfx, 118, WAVE_Y + 23, 5, 12);
-        gfx_draw_line(gfx, 123, WAVE_Y + 23, 130, WAVE_Y + 17);
-        gfx_draw_line(gfx, 123, WAVE_Y + 34, 130, WAVE_Y + 40);
-        gfx_draw_vline(gfx, 130, WAVE_Y + 17, 24);
+        gfx_draw_rect_fill(gfx, 118, cy - 6, 5, 12);
+        gfx_draw_line(gfx, 123, cy - 6, 130, cy - 12);
+        gfx_draw_line(gfx, 123, cy + 5, 130, cy + 11);
+        gfx_draw_vline(gfx, 130, cy - 12, 24);
 
         /* Standing-wave antinodes across center */
         for (int i = 0; i < 128; ++i) {
             const uint16_t ph = (uint16_t)((i * 98304) / 128); /* 1.5 cycles = 3 antinodes */
             const int s = (int)lutsin_q15(ph);
             const int amp = ((s < 0 ? -s : s) * 12) >> 15;
-            gfx_draw_pixel(gfx, 136 + i, WAVE_Y + 29 - amp);
-            gfx_draw_pixel(gfx, 136 + i, WAVE_Y + 29 + amp);
+            gfx_draw_pixel(gfx, 136 + i, cy - amp);
+            gfx_draw_pixel(gfx, 136 + i, cy + amp);
         }
 
         /* Microphone icon on right */
-        gfx_draw_disc(gfx, 274, WAVE_Y + 25, 4, GFX_DRAW_ALL);
-        gfx_draw_vline(gfx, 274, WAVE_Y + 29, 11);
-        gfx_draw_hline(gfx, 270, WAVE_Y + 40, 9);
+        gfx_draw_disc(gfx, 274, cy - 4, 4, GFX_DRAW_ALL);
+        gfx_draw_vline(gfx, 274, cy, 11);
+        gfx_draw_hline(gfx, 270, cy + 11, 9);
 
         draw_room_modes_strip(gfx, m);
-
-        gfx_set_font(gfx, DepartureMono_Regular_10);
-        const char* hint = "REC VOICE/PHRASE  OR  HOLD REREC FOR TAKES";
-        const int hw = (int)gfx_get_str_width(gfx, hint);
-        gfx_draw_str(gfx, SCREEN_CENTER_X - hw / 2, MODE_BAR_Y - 5, hint);
         return;
     }
 
