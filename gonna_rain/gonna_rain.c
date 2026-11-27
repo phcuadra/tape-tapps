@@ -262,10 +262,9 @@ static void sync_params_to_dsp(rain_model_t* m) {
 }
 
 static void rain_sync_engine_active(rain_model_t* m) {
-    const bool need = (m->state == ST_PLAY || m->state == ST_REC ||
-                       m->bouncing || m->play_gain > 0.001f);
-    if (need != m->eng_active) {
-        engine_set_active(need);
+    if (!m->eng_active) {
+        m->eng_active = true;
+        engine_set_active(true);
     }
 }
 
@@ -411,20 +410,28 @@ static void rain_process(void* restrict ctx, mixer_t* restrict mix) {
     }
 
     if (locked) {
-        for (uint32_t i = 0u; i < fs; i += 2u) {
-            out[i] = 0.0f;
-            out[i + 1u] = 0.0f;
-        }
+        memset(out, 0, (size_t)fs * sizeof(float));
         return;
     }
 
     const float vout_tgt = m->vol_out.val;
     const float vfx_tgt  = m->vol_fx.val;
+    const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
+
+    if (st != ST_REC && play_target == 0.0f && m->play_gain <= 0.0001f && !bouncing) {
+        m->play_gain = 0.0f;
+        m->vout_cur  = vout_tgt;
+        m->vfx_cur   = vfx_tgt;
+        memset(out, 0, (size_t)fs * sizeof(float));
+        m->peak_l *= 0.85f;
+        m->peak_r *= 0.85f;
+        return;
+    }
+
     float vo = m->vout_cur;
     float vf = m->vfx_cur;
     const float vol_slew = 0.0045f;
     const float itrim = (m->in_src == 1u) ? m->mic_trim.val : 1.0f;
-    const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
     const float bounce_target = (bouncing && !m->bounce_stop_req) ? 1.0f : 0.0f;
     const float play_step = 1.0f / 720.0f;       /* ~15 ms anti-click */
     const float bounce_step = 1.0f / (float)BOUNCE_FADE_FR;
@@ -569,12 +576,6 @@ static void rain_eng_active(void* ctx, bool state) {
     ((rain_model_t*)ctx)->eng_active = state;
 }
 
-static uint_fast8_t rain_eng_is_active(void* ctx) {
-    const rain_model_t* m = (const rain_model_t*)ctx;
-    return (m->state == ST_PLAY || m->state == ST_REC ||
-            m->bouncing || m->play_gain > 0.001f) ? 1u : 0u;
-}
-
 static void rain_tape_changed(void* ctx) {
     ((rain_model_t*)ctx)->tape_swapped = true;
 }
@@ -583,7 +584,6 @@ static const engine_callbacks_t rain_engine_cb = {
     .process = rain_process,
     .tape_changed = rain_tape_changed,
     .active = rain_eng_active,
-    .is_active = rain_eng_is_active,
 };
 
 /* ----------------------------------------------------------------------------
@@ -1757,36 +1757,23 @@ static bool rain_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Non-destructive dual/quad head loop buffer in PSRAM with >= 256 KB UI
-     *    heap reserve (128 KB on 2s, unconditional on 1s) so `ui_menu_show()` opens:
-     *    24s -> 16s -> 12s -> 8s -> 6s -> 4s -> 3s -> 2s -> 1s.
+     * 3. Non-destructive dual/quad head loop buffer in PSRAM (single `os_malloc`
+     *    without secondary guard probes so the web emulator's ~4.19 MB bump
+     *    allocator never strands memory):
+     *    - On 8 MB hardware: 15s (5.76 MB) succeeds, leaving ~1.2 MB free.
+     *    - On 4.19 MB emulator: 20s/15s/12s return NULL cleanly and 8s (3.07 MB)
+     *      succeeds on first fit, leaving ~1.0 MB untouched!
      */
-    static const uint32_t kCandSecs[] = { 24u, 16u, 12u, 8u, 6u, 4u, 3u, 2u, 1u };
+    static const uint32_t kCandSecs[] = { 20u, 15u, 12u, 8u, 6u, 4u, 2u, 1u };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
         reich_frame_t* lb = (reich_frame_t*)os_malloc((size_t)frames * sizeof(reich_frame_t));
-        if (!lb) continue;
-        if (c + 1u >= n_cands) {
+        if (lb) {
             m->loop_buf = lb;
             m->max_frames = frames;
             break;
         }
-        const size_t guard_sz = (kCandSecs[c] > 2u) ? (256u * 1024u) : (128u * 1024u);
-        void* guard = os_malloc(guard_sz);
-        if (guard) {
-            os_free(guard);
-            m->loop_buf = lb;
-            m->max_frames = frames;
-            break;
-        }
-        os_free(lb);
-    }
-    if (!m->loop_buf) {
-        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
-        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
-        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
-        return false;
     }
 
     if (t) {
@@ -1816,8 +1803,9 @@ static bool rain_app_init(os_app_t* app) {
     rain_hints(m);
 
     os_led_set_pattern(&rain_led_pattern, m);
-    engine_set_active(false);
-    return true;
+    m->eng_active = true;
+    engine_set_active(true);
+    return m->loop_buf != NULL;
 }
 
 static void rain_app_deinit(os_app_t* app) {

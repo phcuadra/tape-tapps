@@ -270,10 +270,9 @@ static void sync_params_to_dsp(sit_model_t* m) {
 }
 
 static void sit_sync_engine_active(sit_model_t* m) {
-    const bool need = (m->state == ST_PLAY || m->state == ST_REC ||
-                       m->bouncing || m->play_gain > 0.001f);
-    if (need != m->eng_active) {
-        engine_set_active(need);
+    if (!m->eng_active) {
+        m->eng_active = true;
+        engine_set_active(true);
     }
 }
 
@@ -419,19 +418,28 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
     }
 
     if (locked) {
-        for (uint32_t i = 0; i < fs; i += 2) {
-            out[i] = 0.0f;
-            out[i + 1] = 0.0f;
-        }
+        memset(out, 0, (size_t)fs * sizeof(float));
         return;
     }
 
     const float vout_tgt = m->vol_out.val;
     const float vfx_tgt  = m->vol_fx.val;
+    const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
+
+    if (st != ST_REC && play_target == 0.0f && m->play_gain <= 0.0001f && !bouncing) {
+        m->play_gain = 0.0f;
+        m->gate_cur  = 0.0f;
+        m->vout_cur  = vout_tgt;
+        m->vfx_cur   = vfx_tgt;
+        memset(out, 0, (size_t)fs * sizeof(float));
+        m->peak_l *= 0.85f;
+        m->peak_r *= 0.85f;
+        return;
+    }
+
     float vo = m->vout_cur;
     float vf = m->vfx_cur;
     const float vol_slew = 0.0045f;
-    const float play_target = (st == ST_PLAY && m->loop_len >= 8u) ? 1.0f : 0.0f;
     const float bounce_target = (bouncing && !m->bounce_stop_req) ? 1.0f : 0.0f;
     const float play_step = 1.0f / 720.0f;       /* ~15 ms anti-click */
     const float gate_step = 1.0f / 1440.0f;      /* ~30 ms SoftSwitch */
@@ -636,12 +644,6 @@ static void sit_eng_active(void* ctx, bool state) {
     ((sit_model_t*)ctx)->eng_active = state;
 }
 
-static uint_fast8_t sit_eng_is_active(void* ctx) {
-    const sit_model_t* m = (const sit_model_t*)ctx;
-    return (m->state == ST_PLAY || m->state == ST_REC ||
-            m->bouncing || m->play_gain > 0.001f) ? 1u : 0u;
-}
-
 static void sit_tape_changed(void* ctx) {
     ((sit_model_t*)ctx)->tape_swapped = true;
 }
@@ -650,7 +652,6 @@ static const engine_callbacks_t sit_engine_cb = {
     .process = sit_process,
     .tape_changed = sit_tape_changed,
     .active = sit_eng_active,
-    .is_active = sit_eng_is_active,
 };
 
 /* ----------------------------------------------------------------------------
@@ -1708,51 +1709,31 @@ static bool sit_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate stereo float RAM loop + Q15 Gen-1 backup with >= 256 KB UI
-     *    heap reserve (128 KB on 1s fallback) so `ui_menu_show()` always opens.
+     * 3. Allocate stereo float RAM loop + Q15 Gen-1 backup in a SINGLE combined
+     *    `os_malloc()` call per candidate so failed larger probes return NULL
+     *    without stranding space in the web emulator's ~4.19 MB bump allocator!
+     *    - On 8 MB hardware: 11s (6.34 MB) succeeds, leaving ~650 KB free.
+     *    - On 4.19 MB emulator: 6s (3.46 MB) succeeds, leaving ~600 KB untouched!
      */
-    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 3u, 2u, 1u };
+    static const uint32_t kCandSecs[] = { 16u, 11u, 9u, 6u, 4u, 2u, 1u };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        const size_t guard_sz = (kCandSecs[c] > 1u) ? (256u * 1024u) : (128u * 1024u);
-        lucier_frame_t* lb = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
-        if (!lb) continue;
-        int16_t* bb = (int16_t*)os_malloc((size_t)frames * 2u * sizeof(int16_t));
-        if (bb) {
-            void* guard = os_malloc(guard_sz);
-            if (guard) {
-                os_free(guard);
-                m->loop_buf = lb;
-                m->backup_buf = bb;
-                m->max_frames = frames;
-                break;
-            }
-            os_free(bb);
+        const size_t lb_bytes = (size_t)frames * sizeof(lucier_frame_t);
+        const size_t bb_bytes = (size_t)frames * 2u * sizeof(int16_t);
+        uint8_t* raw = (uint8_t*)os_malloc(lb_bytes + bb_bytes);
+        if (raw) {
+            m->loop_buf = (lucier_frame_t*)raw;
+            m->backup_buf = (int16_t*)(raw + lb_bytes);
+            m->max_frames = frames;
+            break;
         }
-        os_free(lb);
     }
     if (!m->loop_buf) {
-        /* Last-resort: loop buffer without Gen-1 backup snapshot (2s -> 1s) */
-        for (uint32_t secs = 2u; secs >= 1u; --secs) {
-            const uint32_t frames = secs * TAPP_SAMPLE_RATE;
-            lucier_frame_t* lb = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
-            if (!lb) continue;
-            void* guard = (secs > 1u) ? os_malloc(128u * 1024u) : os_malloc(64u * 1024u);
-            if (guard || secs == 1u) {
-                if (guard) os_free(guard);
-                m->loop_buf = lb;
-                m->max_frames = frames;
-                break;
-            }
-            os_free(lb);
-        }
-        if (!m->loop_buf) {
-            if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
-            if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
-            if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
-            if (m->room_space) { os_free(m->room_space);   m->room_space = NULL; }
-            return false;
+        const uint32_t frames = 1u * TAPP_SAMPLE_RATE;
+        m->loop_buf = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
+        if (m->loop_buf) {
+            m->max_frames = frames;
         }
     }
 
@@ -1783,8 +1764,9 @@ static bool sit_app_init(os_app_t* app) {
     sit_hints(m);
 
     os_led_set_pattern(&sit_led_pattern, m);
-    engine_set_active(false);
-    return true;
+    m->eng_active = true;
+    engine_set_active(true);
+    return m->loop_buf != NULL;
 }
 
 static void sit_app_deinit(os_app_t* app) {
@@ -1818,10 +1800,8 @@ static void sit_app_deinit(os_app_t* app) {
         os_free(m->room_space);
         m->room_space = NULL;
     }
-    if (m->backup_buf) {
-        os_free(m->backup_buf);
-        m->backup_buf = NULL;
-    }
+    /* `backup_buf` aliases the tail of the combined `loop_buf` allocation */
+    m->backup_buf = NULL;
     if (m->loop_buf) {
         os_free(m->loop_buf);
         m->loop_buf = NULL;

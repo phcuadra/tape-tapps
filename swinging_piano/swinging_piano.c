@@ -242,10 +242,9 @@ static void sync_params_to_dsp(swing_model_t* m) {
 }
 
 static void swing_sync_engine_active(swing_model_t* m) {
-    const bool need = (m->state == ST_PLAY || m->state == ST_REC ||
-                       m->bouncing || m->play_gain > 0.001f);
-    if (need != m->eng_active) {
-        engine_set_active(need);
+    if (!m->eng_active) {
+        m->eng_active = true;
+        engine_set_active(true);
     }
 }
 
@@ -494,6 +493,11 @@ static void swing_process(void* restrict ctx, mixer_t* restrict mix) {
         m->vout_cur  = vout_tgt;
         m->vfx_cur   = vfx_tgt;
         memset(out, 0, (size_t)fs * sizeof(float));
+        if (!bouncing) {
+            m->peak_l *= 0.85f;
+            m->peak_r *= 0.85f;
+            return;
+        }
     }
 
     /* Optional Bounce-to-Tape streaming write (unity pre-vout level) */
@@ -585,12 +589,6 @@ static void swing_eng_active(void* ctx, bool state) {
     ((swing_model_t*)ctx)->eng_active = state;
 }
 
-static uint_fast8_t swing_eng_is_active(void* ctx) {
-    const swing_model_t* m = (const swing_model_t*)ctx;
-    return (m->state == ST_PLAY || m->state == ST_REC ||
-            m->bouncing || m->play_gain > 0.001f) ? 1u : 0u;
-}
-
 static void swing_tape_changed(void* ctx) {
     ((swing_model_t*)ctx)->tape_swapped = true;
 }
@@ -599,7 +597,6 @@ static const engine_callbacks_t swing_engine_cb = {
     .process = swing_process,
     .tape_changed = swing_tape_changed,
     .active = swing_eng_active,
-    .is_active = swing_eng_is_active,
 };
 
 /* ----------------------------------------------------------------------------
@@ -1567,9 +1564,9 @@ static bool swing_tick(os_app_t* app) {
 
     swing_sync_engine_active(m);
 
-    /* Step idle visual pendulum only when audio engine is parked */
+    /* Step idle visual pendulum only when audio DSP block is parked */
     bool idle_moving = false;
-    if (!m->eng_active && m->state == ST_STOP) {
+    if (m->state == ST_STOP && m->play_gain <= 0.0001f && !m->bouncing) {
         if (m->push_req) {
             m->push_req = false;
             pendulum_push(&m->dsp, 0.85f);
@@ -1650,6 +1647,7 @@ static void swing_on_resume(os_app_t* app) {
     swing_sync_monitor(m);
     swing_sync_engine_active(m);
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2500u;
 }
 
 static void swing_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
@@ -1822,35 +1820,21 @@ static bool swing_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 3s -> 2s -> 1s),
-     *    keeping >= 128 KB free heap on >= 2s so `ui_menu_show()` always opens on the emulator.
+     * 3. Allocate PSRAM stereo loop buffer (15s -> 12s -> 10s -> 8s -> 6s -> 4s -> 2s -> 1s)
+     *    in a single `os_malloc()` without secondary guard probes so the web
+     *    emulator's ~4.19 MB bump allocator never strands space (10s = 3.84 MB
+     *    fits full 9.6s Felt Piano [102] seed and leaves ~210 KB untouched).
      */
-    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 3u, 2u, 1u };
+    static const uint32_t kCandSecs[] = { 15u, 12u, 10u, 8u, 6u, 4u, 2u, 1u };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
         swing_frame_t* lb = (swing_frame_t*)os_malloc((size_t)frames * sizeof(swing_frame_t));
-        if (!lb) continue;
-        if (c + 1u >= n_cands) {
+        if (lb) {
             m->loop_buf = lb;
             m->max_frames = frames;
             break;
         }
-        void* heap_guard = os_malloc(128u * 1024u);
-        if (heap_guard) {
-            os_free(heap_guard);
-            m->loop_buf = lb;
-            m->max_frames = frames;
-            break;
-        }
-        os_free(lb);
-    }
-    if (!m->loop_buf) {
-        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
-        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
-        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
-        if (m->space)      { os_free(m->space);        m->space = NULL; }
-        return false;
     }
 
     if (t) {
@@ -1878,11 +1862,13 @@ static bool swing_app_init(os_app_t* app) {
     m->hint_swing = m->swing_on;
     m->hint_bounce = m->bouncing;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2500u;
     swing_hints(m);
 
     os_led_set_pattern(&swing_led_pattern, m);
-    engine_set_active(false);
-    return true;
+    m->eng_active = true;
+    engine_set_active(true);
+    return m->loop_buf != NULL;
 }
 
 static void swing_app_deinit(os_app_t* app) {

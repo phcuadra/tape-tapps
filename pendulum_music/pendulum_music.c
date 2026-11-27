@@ -245,10 +245,9 @@ static void sync_params_to_dsp(pm_model_t* m) {
 }
 
 static void pm_sync_engine_active(pm_model_t* m) {
-    const bool need = (m->state == ST_PLAY || m->state == ST_REC ||
-                       m->bouncing || m->play_gain > 0.001f);
-    if (need != m->eng_active) {
-        engine_set_active(need);
+    if (!m->eng_active) {
+        m->eng_active = true;
+        engine_set_active(true);
     }
 }
 
@@ -621,12 +620,6 @@ static void pm_eng_active(void* ctx, bool state) {
     ((pm_model_t*)ctx)->eng_active = state;
 }
 
-static uint_fast8_t pm_eng_is_active(void* ctx) {
-    const pm_model_t* m = (const pm_model_t*)ctx;
-    return (m->state == ST_PLAY || m->state == ST_REC ||
-            m->bouncing || m->play_gain > 0.001f) ? 1u : 0u;
-}
-
 static void pm_tape_changed(void* ctx) {
     ((pm_model_t*)ctx)->tape_swapped = true;
 }
@@ -635,7 +628,6 @@ static const engine_callbacks_t pm_engine_cb = {
     .process = pm_process,
     .tape_changed = pm_tape_changed,
     .active = pm_eng_active,
-    .is_active = pm_eng_is_active,
 };
 
 /* ----------------------------------------------------------------------------
@@ -1108,6 +1100,7 @@ static void pm_vol_show(pm_model_t* m) {
 static void pm_vol_hide(pm_model_t* m) {
     m->vol_ui = false;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 1200u;
     pm_hints(m);
 }
 
@@ -1144,13 +1137,13 @@ static void draw_header(gfx_t* gfx, pm_model_t* m) {
     gfx_set_color(gfx, GFX_COLOR_SET);
     gfx_set_font(gfx, DepartureMono_Regular_10);
 
-    gfx_draw_str(gfx, 8, 63, "PENDULUM MUSIC");
-    int tx = 104;
+    gfx_draw_str(gfx, 8, 63, "PENDULUM");
+    int tx = 8 + (int)gfx_get_str_width(gfx, "PENDULUM") + 6;
 
-    /* Inverted Mode Pill Badge: 1:FEEDBACK (68 px) or 2:SOUND VCA (74 px) */
+    /* Inverted Mode Pill Badge: 1:FEEDBACK or 2:SOUND VCA */
     const bool is_vca = (m->mode == PM_MODE_SOUND_VCA);
     const char* mode_s = is_vca ? "2:SOUND VCA" : "1:FEEDBACK";
-    const int mw = is_vca ? 74 : 68;
+    const int mw = (int)gfx_get_str_width(gfx, mode_s) + 8;
     gfx_draw_rect_fill_r(gfx, tx, 52, mw, 15, 2);
     gfx_set_color(gfx, GFX_COLOR_CLEAR);
     gfx_draw_str(gfx, tx + 4, 63, mode_s);
@@ -1159,27 +1152,23 @@ static void draw_header(gfx_t* gfx, pm_model_t* m) {
 
     /* State Badge */
     const char* st_s = "STOPPED";
-    int sw = 50;
     bool inv_st = false;
     if (m->state == ST_REC) {
         st_s = kRecBadges[m->rec_slot & 3u];
-        sw = 44;
         inv_st = (((os_tick_get() / 280u) & 1u) == 0u);
     } else if (m->state == ST_LOADING) {
         st_s = "LOADING";
-        sw = 50;
         inv_st = true;
     } else if (m->state == ST_PLAY) {
         if (pm_all_nearly_still(&m->dsp, 2.5f)) {
             st_s = "REST CHORD";
-            sw = 68;
             inv_st = true;
         } else {
             st_s = "SWINGING";
-            sw = 56;
         }
     }
 
+    const int sw = (int)gfx_get_str_width(gfx, st_s) + 8;
     if (inv_st) {
         gfx_draw_rect_fill_r(gfx, tx, 52, sw, 15, 2);
         gfx_set_color(gfx, GFX_COLOR_CLEAR);
@@ -1528,6 +1517,7 @@ static void pm_on_resume(os_app_t* app) {
     pm_sync_monitor(m);
     pm_sync_engine_active(m);
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2500u;
 }
 
 static void pm_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
@@ -1707,7 +1697,8 @@ static bool pm_app_init(os_app_t* app) {
 
     /*
      * 3. Allocate PSRAM for 4 custom 24 kHz recording/take slots
-     *    (4s -> 3s -> 2s -> 1s -> 0.5s each), keeping >= 128 KB free for UI menus.
+     *    (4s -> 3s -> 2s -> 1s -> 0.5s each) in a single `os_malloc()` without
+     *    secondary guard probes (4s = 3.07 MB fits and leaves > 1 MB untouched).
      */
     static const uint32_t kCandFrames[] = {
         4u * PM_INTERNAL_SR,
@@ -1721,10 +1712,7 @@ static bool pm_app_init(os_app_t* app) {
         const uint32_t per_slot = kCandFrames[c];
         const size_t bytes = (size_t)per_slot * PM_NUM_MICS * sizeof(pm_frame_t);
         pm_frame_t* mem = (pm_frame_t*)os_malloc(bytes);
-        if (!mem) continue;
-        void* heap_guard = os_malloc((c + 1u < n_cands) ? (128u * 1024u) : (64u * 1024u));
-        if (heap_guard) {
-            os_free(heap_guard);
+        if (mem) {
             m->slots_mem = mem;
             m->max_slot_frames = per_slot;
             for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
@@ -1732,7 +1720,6 @@ static bool pm_app_init(os_app_t* app) {
             }
             break;
         }
-        os_free(mem);
     }
 
     if (t) {
@@ -1759,10 +1746,12 @@ static bool pm_app_init(os_app_t* app) {
     m->hint_mode = m->mode;
     m->hint_bounce = m->bouncing;
     m->ui_dirty = true;
+    m->anim_until_ms = os_tick_get() + 2500u;
     pm_hints(m);
 
     os_led_set_pattern(&pm_led_pattern, m);
-    engine_set_active(false);
+    m->eng_active = true;
+    engine_set_active(true);
     return true;
 }
 
