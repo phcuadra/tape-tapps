@@ -181,7 +181,7 @@ typedef struct {
     params_t          prm[ENC_TOTAL];
     uint8_t           enc_sel;
 
-    /* Volume overlay, mic trim & tape timeline params */
+    /* Volume overlay & mic trim params */
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;         /* 0.40f default (-8 dB) when Mic */
@@ -189,9 +189,6 @@ typedef struct {
     bool              mon_saved;
     bool              wet_saved;
     bool              mon_req;
-    params_t          tl_pos;
-    params_t          tl_start;
-    params_t          tl_end;
 
     /* Menu & cached UI labels */
     ui_menu_t*        menu;
@@ -332,10 +329,6 @@ static void pm_bounce_start(pm_model_t* m) {
     m->bounce_tok = (uint32_t)(uintptr_t)tape_rec_begin(
         t, (start + BOUNCE_FADE_FR) / FRAMES_PER_POS, false);
 
-    m->tl_start.val = m->tl_start.target = (float)(start / FRAMES_PER_POS);
-    m->tl_end.val = m->tl_end.target = (float)(start / FRAMES_PER_POS);
-    tape_timeline_set_loop(false);
-
     if (m->state == ST_STOP) {
         if (pm_all_nearly_still(&m->dsp, 3.0f)) {
             m->pull_req = true;
@@ -368,9 +361,6 @@ static void pm_bounce_stop(pm_model_t* m, tape_t* t) {
 
         if (end_fr > start_fr) {
             tape_cue_add(t, start_fr, end_fr);
-            m->tl_start.val = m->tl_start.target = (float)(start_fr / FRAMES_PER_POS);
-            m->tl_end.val = m->tl_end.target = (float)end_pos;
-            tape_timeline_set_loop(true);
         }
         ui_notify_toast(NotifySuccess, "Pendulum bounce saved", 1800u);
     }
@@ -1108,16 +1098,16 @@ static void pm_vol_hide(pm_model_t* m) {
  * Drawing (400x240 1-bit OLED, fast cached labels & low-cost vector primitives)
  * ------------------------------------------------------------------------- */
 #define GALLERY_X     8
-#define GALLERY_Y     71
+#define GALLERY_Y     72
 #define GALLERY_W     384
-#define GALLERY_H     88
-#define TRUSS_Y       78
-#define PIV_Y         79
-#define FLOOR_Y       145
+#define GALLERY_H     112
+#define TRUSS_Y       80
+#define PIV_Y         81
+#define FLOOR_Y       169
 #define BAY_W         95
 
-#define CARD_Y        163
-#define CARD_H        40
+#define CARD_Y        190
+#define CARD_H        42
 #define CARD_W        93
 #define CARD_GAP      4
 
@@ -1208,14 +1198,14 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         const char* msg = m->load_batch_mode ? "LOADING TAKES 1-4 -> M1-M4..."
                                              : "LOADING TAPE TAKE...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
-        gfx_draw_str(gfx, GALLERY_X + (GALLERY_W - mw) / 2, GALLERY_Y + 34, msg);
+        gfx_draw_str(gfx, GALLERY_X + (GALLERY_W - mw) / 2, GALLERY_Y + 46, msg);
 
         const float pct = (m->load_total48 > 0u)
                               ? ((float)m->load_done48 / (float)m->load_total48)
                               : 0.0f;
-        gfx_draw_rect_r(gfx, GALLERY_X + 36, GALLERY_Y + 48, GALLERY_W - 72, 14, 3);
+        gfx_draw_rect_r(gfx, GALLERY_X + 36, GALLERY_Y + 58, GALLERY_W - 72, 14, 3);
         const int fw = (int)(clampf(pct, 0.0f, 1.0f) * (float)(GALLERY_W - 76) + 0.5f);
-        if (fw > 0) gfx_draw_rect_fill_r(gfx, GALLERY_X + 38, GALLERY_Y + 50, fw, 10, 2);
+        if (fw > 0) gfx_draw_rect_fill_r(gfx, GALLERY_X + 38, GALLERY_Y + 60, fw, 10, 2);
         return;
     }
 
@@ -1230,8 +1220,8 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         }
 
         const float pk = (m->peak_l > m->peak_r) ? m->peak_l : m->peak_r;
-        const int mh = (int)(clampf(pk, 0.0f, 1.0f) * 26.0f);
-        const int mid_y = GALLERY_Y + 40;
+        const int mh = (int)(clampf(pk, 0.0f, 1.0f) * 34.0f);
+        const int mid_y = GALLERY_Y + 52;
         gfx_draw_hline_dithered(gfx, GALLERY_X + 12, mid_y, GALLERY_W - 24, 2);
         if (mh > 0 && fill_w > 4) {
             gfx_draw_rect_fill(gfx, GALLERY_X + 4 + fill_w - 3, mid_y - mh, 3, mh * 2 + 1);
@@ -1281,7 +1271,7 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         }
 
         const float l_norm = clampf((m->dsp.cable_len[i] - 1.85f) * (1.0f / 0.85f), 0.0f, 1.0f);
-        const int r_vis = 37 + (int)(l_norm * 10.0f + 0.5f);
+        const int r_vis = 52 + (int)(l_norm * 14.0f + 0.5f);
 
         /* Fast 2-pip motion trail */
         for (uint32_t t = 0u; t < TRAIL_LEN; ++t) {
@@ -1322,7 +1312,7 @@ static void draw_gallery_stage(gfx_t* gfx, const pm_model_t* m) {
         /* Right-edge per-bay live feedback / VCA vertical bar meter */
         const int vx = bx + BAY_W - 9;
         const int vy = GALLERY_Y + 8;
-        const int vh = 56;
+        const int vh = 78;
         gfx_draw_rect(gfx, vx, vy, 5, vh);
         const int fill_h = (int)(env * (float)(vh - 2) + 0.5f);
         if (fill_h > 0) {
@@ -1364,7 +1354,7 @@ static void draw_param_cards(gfx_t* gfx, pm_model_t* m) {
 
         gfx_set_color(gfx, GFX_COLOR_SET);
         ui_draw_frame(gfx, x, CARD_Y, CARD_W, CARD_H, 3, sel);
-        gfx_draw_str(gfx, x + 5, CARD_Y + 13, p->name);
+        gfx_draw_str(gfx, x + 5, CARD_Y + 14, p->name);
 
         const int16_t pc = (int16_t)(p->val * 100.0f + 0.5f);
         if (pc != m->cached_prm_pc[idx]) {
@@ -1377,12 +1367,12 @@ static void draw_param_cards(gfx_t* gfx, pm_model_t* m) {
             m->cached_prm_x[idx] = (int16_t)(x + CARD_W - 5 -
                                              (int)gfx_get_str_width(gfx, m->cached_prm_str[idx]));
         }
-        gfx_draw_str(gfx, m->cached_prm_x[idx], CARD_Y + 13, m->cached_prm_str[idx]);
+        gfx_draw_str(gfx, m->cached_prm_x[idx], CARD_Y + 14, m->cached_prm_str[idx]);
 
         const int bx = x + 6;
-        const int by = CARD_Y + 22;
+        const int by = CARD_Y + 23;
         const int bw = CARD_W - 12;
-        const int bh = 11;
+        const int bh = 12;
         gfx_draw_rect_r(gfx, bx, by, bw, bh, 2);
 
         const int fill = (int)(clampf(p->val, 0.0f, 1.0f) * (float)(bw - 4) + 0.5f);
@@ -1417,7 +1407,6 @@ static bool pm_tick(os_app_t* app) {
         }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
-        tape_timeline_set_loop(false);
         pm_hints(m);
         m->ui_dirty = true;
     }
@@ -1475,13 +1464,6 @@ static bool pm_tick(os_app_t* app) {
             sync_params_to_dsp(m);
             m->ui_dirty = true;
         }
-    }
-
-    if (m->bouncing) {
-        const float pos = (float)(m->bounce_frame / FRAMES_PER_POS);
-        m->tl_pos.prev = m->tl_pos.val;
-        m->tl_pos.val = m->tl_pos.target = pos;
-        m->tl_end.val = m->tl_end.target = pos;
     }
 
     if (!m->vol_ui && (m->hint_state != m->state ||
@@ -1673,11 +1655,6 @@ static bool pm_app_init(os_app_t* app) {
     m->vout_cur = 0.045f;
     m->vfx_cur  = 0.0f;
 
-    /* Tape timeline strip along bottom edge */
-    m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
-
     /*
      * 2. Allocate SD staging, DMA window pair, and menu BEFORE large slot buffers.
      */
@@ -1722,15 +1699,7 @@ static bool pm_app_init(os_app_t* app) {
         }
     }
 
-    if (t) {
-        tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
-        tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
-        tape_timeline_switch_track(0u);
-        tape_timeline_show_time_display(false);
-        tape_timeline_set_loop(false);
-        tape_timeline_show(true);
-        tape_timeline_zoom_out();
-    }
+    tape_timeline_show(false);
 
     m->in_src = os_audio_get_input();
     m->mon_saved = os_audio_get_monitor();
@@ -1770,7 +1739,6 @@ static void pm_app_deinit(os_app_t* app) {
         m->menu = NULL;
     }
 
-    tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
     if (m->wb) {

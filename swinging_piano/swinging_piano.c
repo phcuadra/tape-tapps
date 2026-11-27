@@ -151,7 +151,7 @@ typedef struct {
     params_t          prm[ENC_TOTAL];
     uint8_t           enc_sel;
 
-    /* Volume overlay, mic trim & tape timeline params */
+    /* Volume overlay & mic trim params */
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;       /* app-local input trim (0.40f default when Mic) */
@@ -161,9 +161,6 @@ typedef struct {
     bool              mon_saved;      /* user's monitor state saved at init, restored at exit */
     bool              wet_saved;      /* user's WET state saved at init, restored at exit */
     bool              mon_req;        /* true when monitor ON was requested for ST_REC */
-    params_t          tl_pos;
-    params_t          tl_start;
-    params_t          tl_end;
 
     /* Menu & cached UI strings */
     ui_menu_t*        menu;
@@ -329,10 +326,6 @@ static void swing_bounce_start(swing_model_t* m) {
     m->bounce_tok = (uint32_t)(uintptr_t)tape_rec_begin(
         t, (start + BOUNCE_FADE_FR) / FRAMES_PER_POS, false);
 
-    m->tl_start.val = m->tl_start.target = (float)(start / FRAMES_PER_POS);
-    m->tl_end.val = m->tl_end.target = (float)(start / FRAMES_PER_POS);
-    tape_timeline_set_loop(false);
-
     m->bouncing = true;
     swing_sync_engine_active(m);
     swing_hints(m);
@@ -356,9 +349,6 @@ static void swing_bounce_stop(swing_model_t* m, tape_t* t) {
 
         if (end_fr > start_fr) {
             tape_cue_add(t, start_fr, end_fr);
-            m->tl_start.val = m->tl_start.target = (float)(start_fr / FRAMES_PER_POS);
-            m->tl_end.val = m->tl_end.target = (float)end_pos;
-            tape_timeline_set_loop(true);
         }
         ui_notify_toast(NotifySuccess, "Swing bounce saved", 1800u);
     }
@@ -1054,25 +1044,25 @@ static void swing_vol_hide(swing_model_t* m) {
 #define RIG_X         8
 #define RIG_Y         74
 #define RIG_W         136
-#define RIG_H         82
+#define RIG_H         110
 #define PIV_X         76
-#define PIV_Y         80
-#define FLOOR_Y       151
+#define PIV_Y         81
+#define FLOOR_Y       178
 #define MIC_LX        51
 #define MIC_RX        101
 
 #define STAGE_X       148
 #define STAGE_Y       74
 #define STAGE_W       244
-#define STAGE_H       82
+#define STAGE_H       110
 #define TRACK_X       154
 #define TRACK_W       232       /* 116 bins * 2px */
-#define TRACK_MID_Y   104
-#define TRACK_HALF_H  22
-#define FOOTER_Y      138
+#define TRACK_MID_Y   118
+#define TRACK_HALF_H  36
+#define FOOTER_Y      166
 
-#define CARD_Y        162
-#define CARD_H        40
+#define CARD_Y        190
+#define CARD_H        42
 #define CARD_W        93
 #define CARD_GAP      4
 
@@ -1183,8 +1173,8 @@ static void draw_pendulum_rig(gfx_t* gfx, const swing_model_t* m) {
         gfx_draw_disc(gfx, ox + dx, oy + dy, 1, GFX_DRAW_ALL);
     }
 
-    /* Visual cable radius scales with ROPE (36..51 px) */
-    const int r_vis = 36 + (int)(clampf(m->prm[ENC_ROPE].val, 0.0f, 1.0f) * 15.0f + 0.5f);
+    /* Visual cable radius scales with ROPE (48..70 px in expanded fly-tower) */
+    const int r_vis = 48 + (int)(clampf(m->prm[ENC_ROPE].val, 0.0f, 1.0f) * 22.0f + 0.5f);
     const float max_arc_deg = clampf(m->prm[ENC_ARC].val, 0.0f, 1.0f) * 55.0f;
 
     /* Dotted circular swing arc guide from -55 to +55 deg */
@@ -1326,7 +1316,7 @@ static void draw_waveform_stage(gfx_t* gfx, const swing_model_t* m) {
         const char* msg = (m->state == ST_SEEDING) ? "SEEDING FELT PIANO [102]..."
                                                    : "RIGGING TAPE TAKE...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
-        gfx_draw_str(gfx, STAGE_X + (STAGE_W - mw) / 2, STAGE_Y + 32, msg);
+        gfx_draw_str(gfx, STAGE_X + (STAGE_W - mw) / 2, STAGE_Y + 46, msg);
 
         float pct = 0.0f;
         if (m->state == ST_SEEDING) {
@@ -1334,9 +1324,9 @@ static void draw_waveform_stage(gfx_t* gfx, const swing_model_t* m) {
         } else if (m->load_total > 0u) {
             pct = (float)m->load_done / (float)m->load_total;
         }
-        gfx_draw_rect_r(gfx, STAGE_X + 20, STAGE_Y + 46, STAGE_W - 40, 14, 3);
+        gfx_draw_rect_r(gfx, STAGE_X + 20, STAGE_Y + 58, STAGE_W - 40, 14, 3);
         const int fw = (int)(clampf(pct, 0.0f, 1.0f) * (float)(STAGE_W - 44) + 0.5f);
-        if (fw > 0) gfx_draw_rect_fill_r(gfx, STAGE_X + 22, STAGE_Y + 48, fw, 10, 2);
+        if (fw > 0) gfx_draw_rect_fill_r(gfx, STAGE_X + 22, STAGE_Y + 60, fw, 10, 2);
         return;
     }
 
@@ -1442,32 +1432,32 @@ static void draw_param_cards(gfx_t* gfx, const swing_model_t* m) {
         ui_draw_frame(gfx, x, CARD_Y, CARD_W, CARD_H, 3, sel);
 
         gfx_set_font(gfx, DepartureMono_Regular_10);
-        gfx_draw_str(gfx, x + 5, CARD_Y + 13, p->name);
+        gfx_draw_str(gfx, x + 5, CARD_Y + 14, p->name);
 
         char val_s[16];
         if (idx == ENC_ROPE) {
             const int dm = (int)((2.20f + 11.80f * p->val) * 10.0f + 0.5f);
             snprintf(val_s, sizeof(val_s), "%d.%dm", dm / 10, dm % 10);
             const int vw = (int)gfx_get_str_width(gfx, val_s);
-            gfx_draw_str(gfx, x + CARD_W - 5 - vw, CARD_Y + 13, val_s);
+            gfx_draw_str(gfx, x + CARD_W - 5 - vw, CARD_Y + 14, val_s);
         } else if (idx == ENC_ARC) {
             const int deg = (int)(p->val * 55.0f + 0.5f);
             snprintf(val_s, sizeof(val_s), "%d", deg);
             const int vw = (int)gfx_get_str_width(gfx, val_s);
             const int vx = x + CARD_W - 10 - vw;
-            gfx_draw_str(gfx, vx, CARD_Y + 13, val_s);
-            draw_deg_ring(gfx, vx + vw + 1, CARD_Y + 4);
+            gfx_draw_str(gfx, vx, CARD_Y + 14, val_s);
+            draw_deg_ring(gfx, vx + vw + 1, CARD_Y + 5);
         } else {
             const int pc = (int)(p->val * 100.0f + 0.5f);
             snprintf(val_s, sizeof(val_s), "%d%%", pc);
             const int vw = (int)gfx_get_str_width(gfx, val_s);
-            gfx_draw_str(gfx, x + CARD_W - 5 - vw, CARD_Y + 13, val_s);
+            gfx_draw_str(gfx, x + CARD_W - 5 - vw, CARD_Y + 14, val_s);
         }
 
         const int bx = x + 6;
-        const int by = CARD_Y + 22;
+        const int by = CARD_Y + 23;
         const int bw = CARD_W - 12;
-        const int bh = 11;
+        const int bh = 12;
         gfx_draw_rect_r(gfx, bx, by, bw, bh, 2);
 
         if (idx == ENC_DOPPLER) {
@@ -1513,7 +1503,6 @@ static bool swing_tick(os_app_t* app) {
         }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
-        tape_timeline_set_loop(false);
         m->ui_dirty = true;
         swing_hints(m);
     }
@@ -1605,13 +1594,6 @@ static bool swing_tick(os_app_t* app) {
             sync_params_to_dsp(m);
             m->ui_dirty = true;
         }
-    }
-
-    if (m->bouncing) {
-        const float pos = (float)(m->bounce_frame / FRAMES_PER_POS);
-        m->tl_pos.prev = m->tl_pos.val;
-        m->tl_pos.val = m->tl_pos.target = pos;
-        m->tl_end.val = m->tl_end.target = pos;
     }
 
     if (!m->vol_ui && (m->hint_state != m->state ||
@@ -1794,11 +1776,6 @@ static bool swing_app_init(os_app_t* app) {
     m->vout_cur = 0.045f;
     m->vfx_cur  = 0.0f;
 
-    /* Tape timeline strip along bottom edge */
-    m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
-
     /*
      * 2. Allocate 62 KB delay/FDN workspace, staging buffer, DMA window pair,
      *    and menu BEFORE the large PSRAM loop buffer so they never starve.
@@ -1837,15 +1814,7 @@ static bool swing_app_init(os_app_t* app) {
         }
     }
 
-    if (t) {
-        tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
-        tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
-        tape_timeline_switch_track(0u);
-        tape_timeline_show_time_display(false);
-        tape_timeline_set_loop(false);
-        tape_timeline_show(true);
-        tape_timeline_zoom_out();
-    }
+    tape_timeline_show(false);
 
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
     m->in_src = os_audio_get_input();
@@ -1887,7 +1856,6 @@ static void swing_app_deinit(os_app_t* app) {
         m->menu = NULL;
     }
 
-    tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
     if (m->wb) {

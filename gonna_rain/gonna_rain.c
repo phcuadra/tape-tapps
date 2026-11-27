@@ -140,7 +140,7 @@ typedef struct {
     params_t          prm[ENC_TOTAL];
     uint8_t           enc_sel;
 
-    /* Volume overlay, mic trim & tape timeline params */
+    /* Volume overlay & mic trim params */
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;       /* app-local input trim (0.40x default when Mic) */
@@ -150,9 +150,6 @@ typedef struct {
     bool              mon_saved;      /* user's monitor state saved at launch, restored at exit */
     bool              wet_saved;      /* user's WET state saved at launch, restored at exit */
     bool              mon_req;        /* true when monitor ON has been requested for ST_REC */
-    params_t          tl_pos;
-    params_t          tl_start;
-    params_t          tl_end;
 
     /* Menu & cached UI strings */
     ui_menu_t*        menu;
@@ -348,10 +345,6 @@ static void rain_bounce_start(rain_model_t* m) {
     m->bounce_tok = (uint32_t)(uintptr_t)tape_rec_begin(
         t, (start + BOUNCE_FADE_FR) / FRAMES_PER_POS, false);
 
-    m->tl_start.val = m->tl_start.target = (float)(start / FRAMES_PER_POS);
-    m->tl_end.val = m->tl_end.target = (float)(start / FRAMES_PER_POS);
-    tape_timeline_set_loop(false);
-
     m->bouncing = true;
     rain_sync_engine_active(m);
     rain_hints(m);
@@ -375,9 +368,6 @@ static void rain_bounce_stop(rain_model_t* m, tape_t* t) {
 
         if (end_fr > start_fr) {
             tape_cue_add(t, start_fr, end_fr);
-            m->tl_start.val = m->tl_start.target = (float)(start_fr / FRAMES_PER_POS);
-            m->tl_end.val = m->tl_end.target = (float)end_pos;
-            tape_timeline_set_loop(true);
         }
         ui_notify_toast(NotifySuccess, "Phase bounce saved", 1800u);
     }
@@ -1005,23 +995,23 @@ static void rain_vol_hide(rain_model_t* m) {
 #define DIAL_BOX_X    8
 #define DIAL_BOX_Y    74
 #define DIAL_BOX_W    98
-#define DIAL_BOX_H    82
+#define DIAL_BOX_H    110
 #define DIAL_CX       57
-#define DIAL_CY       115
-#define DIAL_R        33
+#define DIAL_CY       129
+#define DIAL_R        40
 
 #define STAGE_X       110
 #define STAGE_Y       74
 #define STAGE_W       282
-#define STAGE_H       82
+#define STAGE_H       110
 #define TRACK_X       117
 #define TRACK_W       268     /* 134 bins * 2px */
-#define TRACK_MID_Y   106
-#define TRACK_HALF_H  24
-#define FOOTER_Y      140
+#define TRACK_MID_Y   120
+#define TRACK_HALF_H  38
+#define FOOTER_Y      168
 
-#define CARD_Y        162
-#define CARD_H        40
+#define CARD_Y        190
+#define CARD_H        42
 #define CARD_W        93
 #define CARD_GAP      4
 
@@ -1198,12 +1188,12 @@ static void draw_phase_dial(gfx_t* gfx, const rain_model_t* m) {
                             : clampf(m->prm[ENC_PHASE].val * (1.0f / 360.0f), 0.0f, 1.0f);
     const uint16_t ph_q16 = (uint16_t)(turns * 65536.0f);
 
-    /* Dotted phase-lead arc at r = 22 from 12 o'clock clockwise to Deck B */
-    const uint32_t arc_dots = (uint32_t)(turns * 28.0f);
+    /* Dotted phase-lead arc at r = 27 from 12 o'clock clockwise to Deck B */
+    const uint32_t arc_dots = (uint32_t)(turns * 32.0f);
     for (uint32_t d = 1u; d <= arc_dots; ++d) {
-        const uint16_t da = (uint16_t)((d * 65536u) / 28u);
+        const uint16_t da = (uint16_t)((d * 65536u) / 32u);
         int ax = 0, ay = 0;
-        polar_cw(DIAL_CX, DIAL_CY, 22, da, &ax, &ay);
+        polar_cw(DIAL_CX, DIAL_CY, 27, da, &ax, &ay);
         gfx_draw_pixel(gfx, ax, ay);
     }
 
@@ -1264,14 +1254,14 @@ static void draw_waveform_stage(gfx_t* gfx, const rain_model_t* m) {
         gfx_set_font(gfx, gfx_nunito_semibold_14);
         const char* msg = "LOADING LOOP IN UNISON...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
-        gfx_draw_str(gfx, STAGE_X + (STAGE_W - mw) / 2, STAGE_Y + 32, msg);
+        gfx_draw_str(gfx, STAGE_X + (STAGE_W - mw) / 2, STAGE_Y + 46, msg);
 
         const float pct = (m->load_total > 0u)
                               ? ((float)m->load_done / (float)m->load_total)
                               : 0.0f;
-        gfx_draw_rect_r(gfx, STAGE_X + 24, STAGE_Y + 46, STAGE_W - 48, 14, 3);
+        gfx_draw_rect_r(gfx, STAGE_X + 24, STAGE_Y + 58, STAGE_W - 48, 14, 3);
         const int fw = (int)(clampf(pct, 0.0f, 1.0f) * (float)(STAGE_W - 52) + 0.5f);
-        if (fw > 0) gfx_draw_rect_fill_r(gfx, STAGE_X + 26, STAGE_Y + 48, fw, 10, 2);
+        if (fw > 0) gfx_draw_rect_fill_r(gfx, STAGE_X + 26, STAGE_Y + 60, fw, 10, 2);
         return;
     }
 
@@ -1299,7 +1289,7 @@ static void draw_waveform_stage(gfx_t* gfx, const rain_model_t* m) {
         return;
     }
 
-    /* Empty prompt diagram */
+    /* Empty state: twin phase-shifted Wollensak waves centered vertically */
     if (m->loop_len < 8u) {
         gfx_draw_hline_dithered(gfx, TRACK_X, TRACK_MID_Y, TRACK_W, 1);
 
@@ -1307,18 +1297,14 @@ static void draw_waveform_stage(gfx_t* gfx, const rain_model_t* m) {
         for (int i = 0; i < TRACK_W; i += 2) {
             const uint16_t pa = (uint16_t)((i * 65536) / 68);
             const uint16_t pb = (uint16_t)(((i - 22) * 65536) / 68);
-            const int ya = ((int)lutsin_q15(pa) * 11) >> 15;
-            const int yb = ((int)lutsin_q15(pb) * 11) >> 15;
+            const int ya = ((int)lutsin_q15(pa) * 14) >> 15;
+            const int yb = ((int)lutsin_q15(pb) * 14) >> 15;
             gfx_draw_pixel(gfx, TRACK_X + i, TRACK_MID_Y - 6 - ya);
             if ((i & 2) == 0) {
-                gfx_draw_pixel(gfx, TRACK_X + i, TRACK_MID_Y + 5 - yb);
+                gfx_draw_pixel(gfx, TRACK_X + i, TRACK_MID_Y + 6 - yb);
             }
         }
 
-        gfx_set_font(gfx, DepartureMono_Regular_10);
-        const char* hint = "PRESS REC OR HOLD PHASE FOR TAKES";
-        const int hw = (int)gfx_get_str_width(gfx, hint);
-        gfx_draw_str(gfx, STAGE_X + (STAGE_W - hw) / 2, FOOTER_Y - 6, hint);
         draw_footer_strip(gfx, m);
         return;
     }
@@ -1393,7 +1379,7 @@ static void draw_param_cards(gfx_t* gfx, const rain_model_t* m) {
         ui_draw_frame(gfx, x, CARD_Y, CARD_W, CARD_H, 3, sel);
 
         gfx_set_font(gfx, DepartureMono_Regular_10);
-        gfx_draw_str(gfx, x + 6, CARD_Y + 13, p->name);
+        gfx_draw_str(gfx, x + 6, CARD_Y + 14, p->name);
 
         char val_s[16];
         if (idx == ENC_PHASE) {
@@ -1402,19 +1388,19 @@ static void draw_param_cards(gfx_t* gfx, const rain_model_t* m) {
             snprintf(val_s, sizeof(val_s), "%d", wh);
             const int vw = (int)gfx_get_str_width(gfx, val_s);
             const int vx = x + CARD_W - 11 - vw;
-            gfx_draw_str(gfx, vx, CARD_Y + 13, val_s);
-            draw_deg_ring(gfx, vx + vw + 1, CARD_Y + 4);
+            gfx_draw_str(gfx, vx, CARD_Y + 14, val_s);
+            draw_deg_ring(gfx, vx + vw + 1, CARD_Y + 5);
         } else {
             const int pc = (int)(p->val * 100.0f + 0.5f);
             snprintf(val_s, sizeof(val_s), "%d%%", pc);
             const int vw = (int)gfx_get_str_width(gfx, val_s);
-            gfx_draw_str(gfx, x + CARD_W - 6 - vw, CARD_Y + 13, val_s);
+            gfx_draw_str(gfx, x + CARD_W - 6 - vw, CARD_Y + 14, val_s);
         }
 
         const int bx = x + 6;
-        const int by = CARD_Y + 22;
+        const int by = CARD_Y + 23;
         const int bw = CARD_W - 12;
-        const int bh = 11;
+        const int bh = 12;
         gfx_draw_rect_r(gfx, bx, by, bw, bh, 2);
 
         if (idx == ENC_PHASE) {
@@ -1462,7 +1448,6 @@ static bool rain_tick(os_app_t* app) {
         }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
-        tape_timeline_set_loop(false);
         rain_hints(m);
     }
 
@@ -1564,13 +1549,6 @@ static bool rain_tick(os_app_t* app) {
     if (m->loop_len >= 8u) {
         const float live = reich_get_phase_deg(&m->dsp);
         m->prm[ENC_PHASE].val = m->prm[ENC_PHASE].target = live;
-    }
-
-    if (m->bouncing) {
-        const float pos = (float)(m->bounce_frame / FRAMES_PER_POS);
-        m->tl_pos.prev = m->tl_pos.val;
-        m->tl_pos.val = m->tl_pos.target = pos;
-        m->tl_end.val = m->tl_end.target = pos;
     }
 
     if (!m->vol_ui && (m->hint_state != m->state ||
@@ -1733,11 +1711,6 @@ static bool rain_app_init(os_app_t* app) {
     m->vout_cur = 0.045f;
     m->vfx_cur  = 0.0f;
 
-    /* Tape timeline strip along bottom edge */
-    m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
-
     /*
      * 2. Allocate staging buffer, DMA window pair, and modal menu BEFORE the
      *    large audio loop buffer so menu creation NEVER runs out of heap.
@@ -1776,15 +1749,7 @@ static bool rain_app_init(os_app_t* app) {
         }
     }
 
-    if (t) {
-        tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
-        tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
-        tape_timeline_switch_track(0u);
-        tape_timeline_show_time_display(false);
-        tape_timeline_set_loop(false);
-        tape_timeline_show(true);
-        tape_timeline_zoom_out();
-    }
+    tape_timeline_show(false);
 
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
     m->in_src = os_audio_get_input();
@@ -1824,7 +1789,6 @@ static void rain_app_deinit(os_app_t* app) {
         m->menu = NULL;
     }
 
-    tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
     if (m->wb) {

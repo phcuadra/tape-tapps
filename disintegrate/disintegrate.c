@@ -168,7 +168,7 @@ typedef struct {
     params_t          prm[ENC_TOTAL];
     uint8_t           enc_sel;
 
-    /* Volume overlay, mic trim & timeline params */
+    /* Volume overlay & mic trim params */
     params_t          vol_out;
     params_t          vol_fx;
     params_t          mic_trim;       /* app-local input trim (0.40x default when Mic) */
@@ -178,9 +178,6 @@ typedef struct {
     bool              mon_saved;      /* user's monitor state saved at launch, restored at exit */
     bool              wet_saved;      /* user's WET state saved at launch, restored at exit */
     bool              mon_req;        /* true when monitor ON has been requested for ST_REC */
-    params_t          tl_pos;
-    params_t          tl_start;
-    params_t          tl_end;
 
     /* Menu & cached UI state */
     ui_menu_t*        menu;
@@ -385,10 +382,6 @@ static void dis_bounce_start(dis_model_t* m) {
     m->bounce_tok = (uint32_t)(uintptr_t)tape_rec_begin(
         t, (start + BOUNCE_FADE_FR) / FRAMES_PER_POS, false);
 
-    m->tl_start.val = m->tl_start.target = (float)(start / FRAMES_PER_POS);
-    m->tl_end.val = m->tl_end.target = (float)(start / FRAMES_PER_POS);
-    tape_timeline_set_loop(false);
-
     m->bouncing = true;
     dis_sync_engine_active(m);
     dis_hints(m);
@@ -412,9 +405,6 @@ static void dis_bounce_stop(dis_model_t* m, tape_t* t) {
 
         if (end_fr > start_fr) {
             tape_cue_add(t, start_fr, end_fr);
-            m->tl_start.val = m->tl_start.target = (float)(start_fr / FRAMES_PER_POS);
-            m->tl_end.val = m->tl_end.target = (float)end_pos;
-            tape_timeline_set_loop(true);
         }
         ui_notify_toast(NotifySuccess, "Bounce saved", 1800u);
     }
@@ -1118,13 +1108,13 @@ static void dis_vol_hide(dis_model_t* m) {
 #define WAVE_X       8
 #define WAVE_Y       74
 #define WAVE_W       384      /* 192 bins * 2px */
-#define WAVE_H       82
-#define WAVE_MID_Y   (WAVE_Y + 37)
-#define WAVE_HALF_H  32
+#define WAVE_H       110
+#define WAVE_MID_Y   (WAVE_Y + 51)
+#define WAVE_HALF_H  45
 #define FLAKE_BAR_Y  (WAVE_Y + WAVE_H - 7)
 
-#define CARD_Y       162
-#define CARD_H       40
+#define CARD_Y       190
+#define CARD_H       42
 #define CARD_W       93
 #define CARD_GAP     4
 
@@ -1217,12 +1207,12 @@ static void draw_waveform_stage(gfx_t* gfx, const dis_model_t* m) {
         const char* msg = m->load_is_restore ? "RESTORING FRESH LOOP..."
                                              : "LOADING TAPE TAKE...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
-        gfx_draw_str(gfx, SCREEN_CENTER_X - mw / 2, WAVE_Y + 34, msg);
+        gfx_draw_str(gfx, SCREEN_CENTER_X - mw / 2, WAVE_Y + 46, msg);
 
         const uint32_t pct = (m->load_total > 0u) ? ((m->load_done * 100u) / m->load_total) : 0u;
-        gfx_draw_rect_r(gfx, 60, WAVE_Y + 46, 280, 14, 3);
+        gfx_draw_rect_r(gfx, 60, WAVE_Y + 58, 280, 14, 3);
         const int fw = (int)((276u * pct) / 100u);
-        if (fw > 0) gfx_draw_rect_fill_r(gfx, 62, WAVE_Y + 48, fw, 10, 2);
+        if (fw > 0) gfx_draw_rect_fill_r(gfx, 62, WAVE_Y + 60, fw, 10, 2);
         return;
     }
 
@@ -1334,7 +1324,7 @@ static void draw_param_cards(gfx_t* gfx, const dis_model_t* m) {
 
         /* Parameter name & numeric readout */
         gfx_set_font(gfx, DepartureMono_Regular_10);
-        gfx_draw_str(gfx, x + 6, CARD_Y + 13, p->name);
+        gfx_draw_str(gfx, x + 6, CARD_Y + 14, p->name);
 
         char val_s[16];
         if (idx == ENC_SPEED) {
@@ -1347,13 +1337,13 @@ static void draw_param_cards(gfx_t* gfx, const dis_model_t* m) {
             snprintf(val_s, sizeof(val_s), "%d%%", pc);
         }
         const int vw = (int)gfx_get_str_width(gfx, val_s);
-        gfx_draw_str(gfx, x + CARD_W - 6 - vw, CARD_Y + 13, val_s);
+        gfx_draw_str(gfx, x + CARD_W - 6 - vw, CARD_Y + 14, val_s);
 
         /* Bar meter */
         const int bx = x + 6;
-        const int by = CARD_Y + 22;
+        const int by = CARD_Y + 23;
         const int bw = CARD_W - 12;
-        const int bh = 11;
+        const int bh = 12;
         gfx_draw_rect_r(gfx, bx, by, bw, bh, 2);
 
         if (idx == ENC_SPEED) {
@@ -1408,7 +1398,6 @@ static bool dis_tick(os_app_t* app) {
         }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
-        tape_timeline_set_loop(false);
         dis_hints(m);
     }
 
@@ -1533,14 +1522,6 @@ static bool dis_tick(os_app_t* app) {
                 m->dust_life[p] = (uint8_t)(8u + (vis_rand(m) & 15u));
             }
         }
-    }
-
-    /* Update tape timeline strip */
-    if (m->bouncing) {
-        const float pos = (float)(m->bounce_frame / FRAMES_PER_POS);
-        m->tl_pos.prev = m->tl_pos.val;
-        m->tl_pos.val = m->tl_pos.target = pos;
-        m->tl_end.val = m->tl_end.target = pos;
     }
 
     /* Refresh hint bar if state drifted */
@@ -1697,11 +1678,6 @@ static bool dis_app_init(os_app_t* app) {
     m->vout_cur = 0.045f;
     m->vfx_cur  = 0.0f;
 
-    /* Tape timeline strip along bottom edge */
-    m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
-    m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
-
     /*
      * 2. Allocate staging buffer, DMA window pair, and modal menu BEFORE the
      *    large audio loop buffers so menu creation NEVER runs out of heap.
@@ -1740,15 +1716,7 @@ static bool dis_app_init(os_app_t* app) {
         }
     }
 
-    if (t) {
-        tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
-        tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
-        tape_timeline_switch_track(0u);
-        tape_timeline_show_time_display(false);
-        tape_timeline_set_loop(false);
-        tape_timeline_show(true);
-        tape_timeline_zoom_out();
-    }
+    tape_timeline_show(false);
 
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
     m->in_src = os_audio_get_input();
@@ -1788,7 +1756,6 @@ static void dis_app_deinit(os_app_t* app) {
         m->menu = NULL;
     }
 
-    tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
     if (m->backup_mode == BACKUP_STORAGE_FILE) {
