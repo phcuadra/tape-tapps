@@ -199,6 +199,7 @@ void lucier_init(lucier_engine_t* d, float sample_rate) {
     d->dry_env_sq  = 0.04f;
     d->wet_env_sq  = 0.01f;
     d->agc_gain    = 1.8f;
+    d->rng_state   = 0x6D2B79F5u;
 
     lucier_update_coeffs(d);
 }
@@ -246,6 +247,7 @@ void lucier_reset_state(lucier_engine_t* d, float initial_rms) {
     d->dry_env_sq = tgt * tgt;
     d->wet_env_sq = 0.25f * tgt * tgt;
     d->agc_gain   = 1.8f;
+    if (d->rng_state == 0u) d->rng_state = 0x6D2B79F5u;
 }
 
 void lucier_set_pass(lucier_engine_t* d, float norm) {
@@ -432,7 +434,38 @@ lucier_frame_t lucier_process_frame(lucier_engine_t* d, lucier_frame_t in, float
     return res;
 }
 
-void lucier_commit_step(const lucier_engine_t* d, lucier_frame_t* buf, uint32_t rec_size,
+static inline uint32_t lucier_next_u32(lucier_engine_t* d) {
+    uint32_t x = d->rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    d->rng_state = x ? x : 0x6D2B79F5u;
+    return d->rng_state;
+}
+
+static inline lucier_pframe_t lucier_pack_stochastic(lucier_engine_t* d, lucier_frame_t next_gen) {
+    const float xl = (fabsf(next_gen.l) < LUCIER_SILENCE_FLOOR) ? 0.0f : lucier_clip_guard(next_gen.l);
+    const float xr = (fabsf(next_gen.r) < LUCIER_SILENCE_FLOOR) ? 0.0f : lucier_clip_guard(next_gen.r);
+
+    int32_t ql = 0;
+    int32_t qr = 0;
+    if (xl != 0.0f) {
+        const float ul01 = (float)(lucier_next_u32(d) >> 8) * (1.0f / 16777216.0f);
+        ql = (int32_t)floorf(xl * LUCIER_Q_SCALE + ul01);
+        if (ql >  32767) ql =  32767;
+        if (ql < -32767) ql = -32767;
+    }
+    if (xr != 0.0f) {
+        const float ur01 = (float)(lucier_next_u32(d) >> 8) * (1.0f / 16777216.0f);
+        qr = (int32_t)floorf(xr * LUCIER_Q_SCALE + ur01);
+        if (qr >  32767) qr =  32767;
+        if (qr < -32767) qr = -32767;
+    }
+    lucier_pframe_t pf = { (uint32_t)(uint16_t)(int16_t)ql | ((uint32_t)(uint16_t)(int16_t)qr << 16) };
+    return pf;
+}
+
+void lucier_commit_step(lucier_engine_t* d, lucier_pframe_t* buf, uint32_t rec_size,
                         int32_t prev_i, int32_t step, lucier_frame_t next_gen, float gate) {
     if (!buf || rec_size < 8u || d->pass_mix <= 0.0001f || gate <= 0.0001f) return;
 
@@ -441,14 +474,14 @@ void lucier_commit_step(const lucier_engine_t* d, lucier_frame_t* buf, uint32_t 
         for (int32_t k = 0; k < step; ++k) {
             int32_t idx = (prev_i + k) % size;
             if (idx < 0) idx += size;
-            buf[idx] = next_gen;
+            buf[idx] = lucier_pack_stochastic(d, next_gen);
         }
     } else if (step < 0 && -step <= LUCIER_MAX_STEP_FR) {
         const int32_t n = -step;
         for (int32_t k = 0; k < n; ++k) {
             int32_t idx = (prev_i + 1 - k) % size;
             if (idx < 0) idx += size;
-            buf[idx] = next_gen;
+            buf[idx] = lucier_pack_stochastic(d, next_gen);
         }
     }
 }

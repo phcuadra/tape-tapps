@@ -61,6 +61,14 @@ enum {
     ENC_TOTAL,
 };
 
+#define SIT_BACKUP_PATH  "/gen1_loop.bin"
+
+enum {
+    BACKUP_NONE = 0,
+    BACKUP_STORAGE_FILE,
+    BACKUP_TAPE_SPAN,
+};
+
 /* ----------------------------------------------------------------------------
  * Model (kept small ~3.5 KB in internal RAM; audio & room buffers in os_malloc)
  * ------------------------------------------------------------------------- */
@@ -78,15 +86,17 @@ typedef struct {
     /* Audio engine active flag */
     volatile bool     eng_active;
 
-    /* RAM loop buffer + Q15 Generation-1 backup + room delay space (PSRAM via os_malloc) */
-    lucier_frame_t*   loop_buf;
-    int16_t*          backup_buf;     /* interleaved Q15 L/R Generation-1 snapshot */
+    /* RAM loop buffer (4 B/frame aligned 32-bit stereo Q2.14 in PSRAM via os_malloc) */
+    lucier_pframe_t*  loop_buf;
     float*            read_stage;     /* LOAD_CHUNK_FR * 2 floats for tape_read */
     lucier_space_t*   room_space;     /* early reflections & Schroeder allpass workspace */
     uint32_t          max_frames;
     volatile uint32_t loop_len;
+
+    /* Zero-RAM-overhead Generation-1 backup (app-private SD file or source tape span) */
+    uint8_t           backup_mode;
     uint32_t          backup_len;
-    bool              has_backup;
+    uint32_t          backup_src_frame;
 
     /* Live capture & button-click pop suppression state */
     volatile uint32_t rec_frames;
@@ -111,10 +121,11 @@ typedef struct {
     /* Core Lucier Room-Resonance + EQ DSP engine */
     lucier_engine_t   dsp;
 
-    /* Chunked tape-take loader state */
+    /* Chunked tape-take / restore loader state */
     uint32_t          load_src_frame;
     uint32_t          load_total;
     uint32_t          load_done;
+    bool              load_is_restore;
 
     /* Bounce-to-tape streaming state (DMA windows) */
     tape_buffer_t*    wb;
@@ -183,13 +194,7 @@ static void sit_sync_monitor(sit_model_t* m);
 /* ----------------------------------------------------------------------------
  * Small helpers (f32 & 32-bit int only)
  * ------------------------------------------------------------------------- */
-static inline int16_t f32_to_q15(float x) {
-    float c = clampf(x, -1.0f, 1.0f);
-    float s = c * 32767.0f;
-    return (int16_t)(s >= 0.0f ? (s + 0.5f) : (s - 0.5f));
-}
-
-static void apply_loop_splice(lucier_frame_t* buf, uint32_t len) {
+static void apply_loop_splice(lucier_pframe_t* buf, uint32_t len) {
     if (!buf || len < 16u) return;
     uint32_t fade = SPLICE_FADE_FR;
     if (fade > (len >> 3)) fade = len >> 3;
@@ -199,26 +204,17 @@ static void apply_loop_splice(lucier_frame_t* buf, uint32_t len) {
     for (uint32_t i = 0; i < fade; ++i) {
         const float t = (float)i * inv;
         const float w = t * t * (3.0f - 2.0f * t);
-        buf[i].l *= w;
-        buf[i].r *= w;
-        const uint32_t tail = len - 1u - i;
-        buf[tail].l *= w;
-        buf[tail].r *= w;
+        const lucier_frame_t head = lucier_frame_unpack(buf[i]);
+        buf[i] = lucier_frame_pack(head.l * w, head.r * w);
+        const uint32_t tail_idx = len - 1u - i;
+        const lucier_frame_t tail = lucier_frame_unpack(buf[tail_idx]);
+        buf[tail_idx] = lucier_frame_pack(tail.l * w, tail.r * w);
     }
 }
 
-static void save_gen1_backup_and_waves(sit_model_t* m, bool write_q15) {
+static void build_waves_and_rms(sit_model_t* m, bool set_orig) {
     const uint32_t len = m->loop_len;
     if (!m->loop_buf || len < 8u) return;
-
-    if (write_q15 && m->backup_buf) {
-        for (uint32_t i = 0; i < len; ++i) {
-            m->backup_buf[i * 2u]      = f32_to_q15(m->loop_buf[i].l);
-            m->backup_buf[i * 2u + 1u] = f32_to_q15(m->loop_buf[i].r);
-        }
-        m->backup_len = len;
-        m->has_backup = true;
-    }
 
     float energy = 0.0f;
     float global_pk = 0.0f;
@@ -234,8 +230,9 @@ static void save_gen1_backup_and_waves(sit_model_t* m, bool write_q15) {
 
         float pk = 0.0f;
         for (uint32_t i = f0; i < f1; i += step) {
-            const float al = fabsf(m->loop_buf[i].l);
-            const float ar = fabsf(m->loop_buf[i].r);
+            const lucier_frame_t s = lucier_frame_unpack(m->loop_buf[i]);
+            const float al = fabsf(s.l);
+            const float ar = fabsf(s.r);
             const float a = (al > ar) ? al : ar;
             if (a > pk) pk = a;
             energy += 0.5f * (al * al + ar * ar);
@@ -243,7 +240,7 @@ static void save_gen1_backup_and_waves(sit_model_t* m, bool write_q15) {
         }
         if (pk > global_pk) global_pk = pk;
         const uint32_t h = (uint32_t)(clampf(pk, 0.0f, 1.0f) * 255.0f);
-        if (write_q15) m->wave_orig[b] = (uint8_t)h;
+        if (set_orig) m->wave_orig[b] = (uint8_t)h;
         m->wave_curr[b] = (uint8_t)h;
     }
 
@@ -449,7 +446,7 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
     float pl = 0.0f;
     float pr = 0.0f;
 
-    lucier_frame_t* lbuf = m->loop_buf;
+    lucier_pframe_t* lbuf = m->loop_buf;
     const uint32_t len = m->loop_len;
 
     for (uint32_t i = 0; i < fs; i += 2) {
@@ -487,8 +484,8 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
                         const float t = (float)rf * (1.0f / (float)REC_FADE_IN_FR);
                         fg = t * t * (3.0f - 2.0f * t);
                     }
-                    lbuf[rf].l = lucier_clip_guard(il * fg);
-                    lbuf[rf].r = lucier_clip_guard(ir * fg);
+                    lbuf[rf] = lucier_frame_pack(lucier_clip_guard(il * fg),
+                                                 lucier_clip_guard(ir * fg));
                     m->rec_frames = rf + 1u;
                     if (m->rec_frames >= m->max_frames) {
                         m->rec_done_req = true;
@@ -533,10 +530,12 @@ static void sit_process(void* restrict ctx, mixer_t* restrict mix) {
                 const int32_t i1 = (i0 + 1 < size) ? (i0 + 1) : 0;
                 const float frac = m->head_f;
 
-                /* Linearly interpolated stereo read from current generation buffer */
+                /* Linearly interpolated stereo read from 32-bit packed generation buffer */
+                const lucier_frame_t s0 = lucier_frame_unpack(lbuf[i0]);
+                const lucier_frame_t s1 = lucier_frame_unpack(lbuf[i1]);
                 lucier_frame_t dry = {
-                    lucier_clip_guard(lbuf[i0].l + frac * (lbuf[i1].l - lbuf[i0].l)),
-                    lucier_clip_guard(lbuf[i0].r + frac * (lbuf[i1].r - lbuf[i0].r)),
+                    lucier_clip_guard(s0.l + frac * (s1.l - s0.l)),
+                    lucier_clip_guard(s0.r + frac * (s1.r - s0.r)),
                 };
 
                 /* Run room + EQ chain continuously (primes AGC during GEN 1; transforms when gg > 0) */
@@ -760,7 +759,17 @@ static void sit_finish_capture(sit_model_t* m) {
     m->play_gain = 0.0f;
     m->gate_cur = 0.0f;
 
-    save_gen1_backup_and_waves(m, true);
+    build_waves_and_rms(m, true);
+
+    /* Spill pristine Gen-1 capture to app-private SD storage (zero RAM backup overhead) */
+    const size_t bytes = (size_t)captured * sizeof(lucier_pframe_t);
+    if (storage_write_file(SIT_BACKUP_PATH, m->loop_buf, bytes) > 0u) {
+        m->backup_mode = BACKUP_STORAGE_FILE;
+        m->backup_len = captured;
+    } else {
+        m->backup_mode = BACKUP_NONE;
+        m->backup_len = 0u;
+    }
 
     m->state = ST_PLAY;
     m->buf_locked = false;
@@ -769,20 +778,7 @@ static void sit_finish_capture(sit_model_t* m) {
     sit_hints(m);
 }
 
-static void sit_do_restore(sit_model_t* m) {
-    if (!m->has_backup || !m->backup_buf || !m->loop_buf || m->backup_len < 8u) {
-        ui_notify_toast(NotifyWarning, "No Gen 1 backup", 1800u);
-        return;
-    }
-
-    m->buf_locked = true;
-    const uint32_t len = m->backup_len;
-    const float inv = 1.0f / 32767.0f;
-    for (uint32_t i = 0; i < len; ++i) {
-        m->loop_buf[i].l = (float)m->backup_buf[i * 2u] * inv;
-        m->loop_buf[i].r = (float)m->backup_buf[i * 2u + 1u] * inv;
-    }
-
+static void sit_reset_restored_gen1(sit_model_t* m, uint32_t len) {
     m->loop_len = len;
     m->head_i = 0;
     m->head_f = 0.0f;
@@ -792,8 +788,44 @@ static void sit_do_restore(sit_model_t* m) {
     m->gate_cur = 0.0f;
 
     memcpy(m->wave_curr, m->wave_orig, sizeof(m->wave_curr));
-    save_gen1_backup_and_waves(m, false);
+    build_waves_and_rms(m, false);
+}
 
+static void sit_do_restore(sit_model_t* m) {
+    if (m->backup_mode == BACKUP_NONE || !m->loop_buf || m->backup_len < 8u ||
+        m->backup_len > m->max_frames) {
+        ui_notify_toast(NotifyWarning, "No Gen 1 backup", 1800u);
+        return;
+    }
+
+    const uint32_t len = m->backup_len;
+
+    if (m->backup_mode == BACKUP_TAPE_SPAN) {
+        tape_t* t = tape_get();
+        if (!t || !m->read_stage) {
+            ui_notify_toast(NotifyWarning, "Tape unavailable", 1800u);
+            return;
+        }
+        m->buf_locked = true;
+        m->load_is_restore = true;
+        m->load_src_frame = m->backup_src_frame;
+        m->load_total = len;
+        m->load_done = 0u;
+        m->state = ST_LOADING;
+        sit_sync_engine_active(m);
+        sit_hints(m);
+        return;
+    }
+
+    m->buf_locked = true;
+    const size_t bytes = (size_t)len * sizeof(lucier_pframe_t);
+    if (storage_read_file(SIT_BACKUP_PATH, m->loop_buf, bytes) == 0u) {
+        m->buf_locked = false;
+        ui_notify_toast(NotifyError, "Backup read failed", 1800u);
+        return;
+    }
+
+    sit_reset_restored_gen1(m, len);
     if (m->state == ST_STOP) {
         m->state = ST_PLAY;
     }
@@ -808,7 +840,8 @@ static void sit_do_clear(sit_model_t* m) {
     m->state = ST_STOP;
     m->loop_len = 0u;
     m->backup_len = 0u;
-    m->has_backup = false;
+    m->backup_mode = BACKUP_NONE;
+    m->load_is_restore = false;
     m->head_i = 0;
     m->head_f = 0.0f;
     m->generation = 0u;
@@ -846,6 +879,7 @@ static void sit_start_take_load(sit_model_t* m, uint32_t take_idx) {
     }
 
     m->buf_locked = true;
+    m->load_is_restore = false;
     m->load_src_frame = s;
     m->load_total = len;
     m->load_done = 0u;
@@ -858,6 +892,7 @@ static void sit_step_take_load(sit_model_t* m) {
     tape_t* t = tape_get();
     if (!t || !m->read_stage || !m->loop_buf) {
         m->state = ST_STOP;
+        m->load_is_restore = false;
         m->buf_locked = false;
         return;
     }
@@ -867,35 +902,52 @@ static void sit_step_take_load(sit_model_t* m) {
     const uint32_t got = tape_read(t, m->load_src_frame + m->load_done, m->read_stage, chunk);
     if (got == 0u) {
         m->state = ST_STOP;
+        m->load_is_restore = false;
         m->buf_locked = false;
         ui_notify_toast(NotifyError, "Tape read failed", 1800u);
         return;
     }
 
     for (uint32_t i = 0; i < got; ++i) {
-        m->loop_buf[m->load_done + i].l = m->read_stage[i * 2u];
-        m->loop_buf[m->load_done + i].r = m->read_stage[i * 2u + 1u];
+        m->loop_buf[m->load_done + i] = lucier_frame_pack(
+            lucier_clip_guard(m->read_stage[i * 2u]),
+            lucier_clip_guard(m->read_stage[i * 2u + 1u]));
     }
     m->load_done += got;
 
     if (m->load_done >= m->load_total) {
         const uint32_t len = m->load_done;
         apply_loop_splice(m->loop_buf, len);
-        m->loop_len = len;
-        m->head_i = 0;
-        m->head_f = 0.0f;
-        m->generation = 1u;
-        m->gen1_statement = true;
-        m->play_gain = 0.0f;
-        m->gate_cur = 0.0f;
 
-        save_gen1_backup_and_waves(m, true);
+        if (m->load_is_restore) {
+            m->load_is_restore = false;
+            sit_reset_restored_gen1(m, len);
+            m->state = ST_PLAY;
+            m->buf_locked = false;
+            sit_sync_engine_active(m);
+            sit_hints(m);
+            ui_notify_toast(NotifySuccess, "Restored Gen 1", 1800u);
+        } else {
+            m->loop_len = len;
+            m->head_i = 0;
+            m->head_f = 0.0f;
+            m->generation = 1u;
+            m->gen1_statement = true;
+            m->play_gain = 0.0f;
+            m->gate_cur = 0.0f;
 
-        m->state = ST_PLAY;
-        m->buf_locked = false;
-        sit_sync_engine_active(m);
-        sit_hints(m);
-        ui_notify_toast(NotifySuccess, "Loaded as Gen 1", 1800u);
+            m->backup_mode = BACKUP_TAPE_SPAN;
+            m->backup_src_frame = m->load_src_frame;
+            m->backup_len = len;
+
+            build_waves_and_rms(m, true);
+
+            m->state = ST_PLAY;
+            m->buf_locked = false;
+            sit_sync_engine_active(m);
+            sit_hints(m);
+            ui_notify_toast(NotifySuccess, "Loaded as Gen 1", 1800u);
+        }
     }
 }
 
@@ -1225,10 +1277,11 @@ static void draw_waveform_stage(gfx_t* gfx, const sit_model_t* m) {
     gfx_set_color(gfx, GFX_COLOR_SET);
     gfx_draw_rect_r(gfx, WAVE_X, WAVE_Y, WAVE_W, WAVE_H, 3);
 
-    /* Loading progress view */
+    /* Loading / restoring progress view */
     if (m->state == ST_LOADING) {
         gfx_set_font(gfx, gfx_nunito_semibold_14);
-        const char* msg = "LOADING TAKE AS GEN 1...";
+        const char* msg = m->load_is_restore ? "RESTORING GEN 1..."
+                                             : "LOADING TAKE AS GEN 1...";
         const int mw = (int)gfx_get_str_width(gfx, msg);
         gfx_draw_str(gfx, SCREEN_CENTER_X - mw / 2, WAVE_Y + 34, msg);
 
@@ -1408,6 +1461,10 @@ static bool sit_tick(os_app_t* app) {
             m->bouncing = false;
             m->bounce_tok = 0u;
         }
+        if (m->backup_mode == BACKUP_TAPE_SPAN) {
+            m->backup_mode = BACKUP_NONE;
+            m->backup_len = 0u;
+        }
         if (m->wb) tape_buffer_clear_all_buffers(m->wb);
         m->bounce_cur_win = WIN_NONE;
         tape_timeline_set_loop(false);
@@ -1475,8 +1532,9 @@ static bool sit_tick(os_app_t* app) {
             float sq = 0.0f;
             uint32_t cnt = 0u;
             for (uint32_t i = f0; i < f1; i += stride) {
-                const float al = fabsf(m->loop_buf[i].l);
-                const float ar = fabsf(m->loop_buf[i].r);
+                const lucier_frame_t s = lucier_frame_unpack(m->loop_buf[i]);
+                const float al = fabsf(s.l);
+                const float ar = fabsf(s.r);
                 const float a = (al > ar) ? al : ar;
                 if (a > pk) pk = a;
                 sq += 0.5f * (al * al + ar * ar);
@@ -1709,31 +1767,22 @@ static bool sit_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate stereo float RAM loop + Q15 Gen-1 backup in a SINGLE combined
-     *    `os_malloc()` call per candidate so failed larger probes return NULL
-     *    without stranding space in the web emulator's ~4.19 MB bump allocator!
-     *    - On 8 MB hardware: 11s (6.34 MB) succeeds, leaving ~650 KB free.
-     *    - On 4.19 MB emulator: 6s (3.46 MB) succeeds, leaving ~600 KB untouched!
+     * 3. Allocate 4-byte/frame (192 KB/s at 48 kHz) stereo loop buffer with
+     *    1-second granularity and zero RAM backup overhead:
+     *    - On *tape!* hardware (~1.5–2.0 MB free PSRAM): 8s–10s (1.54–1.92 MB) fits!
+     *    - On web emulator (~4.19 MB bump arena): 16s (3.07 MB) fits on first call!
      */
-    static const uint32_t kCandSecs[] = { 16u, 11u, 9u, 6u, 4u, 2u, 1u };
+    static const uint32_t kCandSecs[] = {
+        16u, 14u, 12u, 11u, 10u, 9u, 8u, 7u, 6u, 5u, 4u, 3u, 2u, 1u
+    };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        const size_t lb_bytes = (size_t)frames * sizeof(lucier_frame_t);
-        const size_t bb_bytes = (size_t)frames * 2u * sizeof(int16_t);
-        uint8_t* raw = (uint8_t*)os_malloc(lb_bytes + bb_bytes);
-        if (raw) {
-            m->loop_buf = (lucier_frame_t*)raw;
-            m->backup_buf = (int16_t*)(raw + lb_bytes);
+        lucier_pframe_t* lb = (lucier_pframe_t*)os_malloc((size_t)frames * sizeof(lucier_pframe_t));
+        if (lb) {
+            m->loop_buf = lb;
             m->max_frames = frames;
             break;
-        }
-    }
-    if (!m->loop_buf) {
-        const uint32_t frames = 1u * TAPP_SAMPLE_RATE;
-        m->loop_buf = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
-        if (m->loop_buf) {
-            m->max_frames = frames;
         }
     }
 
@@ -1788,6 +1837,12 @@ static void sit_app_deinit(os_app_t* app) {
     tape_timeline_set_loop(false);
     tape_timeline_show(false);
 
+    if (m->backup_mode == BACKUP_STORAGE_FILE) {
+        (void)storage_delete_file(SIT_BACKUP_PATH);
+        (void)storage_delete_file(SIT_BACKUP_PATH ".bak");
+        m->backup_mode = BACKUP_NONE;
+    }
+
     if (m->wb) {
         tape_buffer_deinit(m->wb);
         m->wb = NULL;
@@ -1800,8 +1855,6 @@ static void sit_app_deinit(os_app_t* app) {
         os_free(m->room_space);
         m->room_space = NULL;
     }
-    /* `backup_buf` aliases the tail of the combined `loop_buf` allocation */
-    m->backup_buf = NULL;
     if (m->loop_buf) {
         os_free(m->loop_buf);
         m->loop_buf = NULL;

@@ -4,7 +4,7 @@ A standalone *tape!* application (`AppTypeStandalone`) modeled after Alvin Lucie
 
 ## Architecture & DSP (`lucier_dsp.c` / `inc/lucier_dsp.h`)
 
-- **RAM Loop Buffer + Clean Generation-1 Q15 Backup + Room Space**: Allocates up to 16 seconds of stereo 48 kHz `float` loop memory, a matching `int16_t` Q15 Generation-1 backup snapshot (with graceful fallback down to 2 s), and a ~28 KB stereo reflection/diffusion workspace via `os_malloc()` in PSRAM while keeping the `sit_model_t` app struct small (~2.7 KB in internal SRAM).
+- **Packed Q2.14 RAM Loop + Zero-RAM Gen-1 Restore + Room Space**: Stores stereo 48 kHz audio as 32-bit-aligned packed Q2.14 frames (`4 B/frame` = `192 KB/s`, ±1.20 full-scale headroom, unbiased stochastic rounding across generations) with 1-second allocation granularity (`8–10 s` on *tape!* hardware PSRAM, `16 s` on the web emulator) alongside the ~28 KB stereo reflection/diffusion workspace. Pristine Generation-1 snapshots spill to app-private SD storage (`/gen1_loop.bin`) or re-read directly from the source tape span with zero RAM backup overhead.
 - **Generation-1 Clean Statement**: Newly captured, loaded, or restored loops play through `GEN 1` cleanly once while priming the room's RMS level trackers, then seamlessly engage iterative room re-recording on `GEN 2, 3, 4...` (or immediately if toggled manually).
 - **Per-Generation Acoustic Re-Recording Chain**:
   1. **Early Wall Reflections & Stereo Schroeder Allpass Diffusion**: 3-tap stereo room reflection lines scaled by `ROOM` with 18% L↔R cross-wall coupling feeding 2 cascaded Schroeder allpass diffusers per channel (`g_ap = 0.38 + 0.24 * RESO`). Bridges inter-word gaps and progressively smears consonant plosives across passes while preserving zero-delay direct arrival phase.

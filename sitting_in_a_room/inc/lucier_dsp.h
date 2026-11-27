@@ -28,6 +28,43 @@ typedef struct {
 } lucier_frame_t;
 
 /*
+ * 4-byte 32-bit-aligned packed stereo loop frame (192 KB/sec at 48 kHz — 3x smaller
+ * than float32 + Q15 backup, enabling 8–10s loops in *tape!* hardware PSRAM).
+ * Full scale is ±1.2000f (+1.58 dBFS analog headroom matching lucier_clip_guard),
+ * accessed strictly as 32-bit words so OCTOSPI PSRAM never sees halfword accesses.
+ */
+#define LUCIER_Q_SCALE  27306.0f
+#define LUCIER_Q_INV    (1.0f / 27306.0f)
+
+typedef struct __attribute__((aligned(4))) {
+    uint32_t lr;    /* low 16 bits: int16_t L, high 16 bits: int16_t R */
+} lucier_pframe_t;
+
+static inline int16_t lucier_f32_to_q(float x) {
+    if (x >  1.2f) x =  1.2f;
+    if (x < -1.2f) x = -1.2f;
+    const float s = x * LUCIER_Q_SCALE;
+    int32_t q = (int32_t)(s >= 0.0f ? (s + 0.5f) : (s - 0.5f));
+    if (q >  32767) q =  32767;
+    if (q < -32767) q = -32767;
+    return (int16_t)q;
+}
+
+static inline lucier_pframe_t lucier_frame_pack(float l, float r) {
+    const uint16_t ul = (uint16_t)lucier_f32_to_q(l);
+    const uint16_t ur = (uint16_t)lucier_f32_to_q(r);
+    lucier_pframe_t f = { (uint32_t)ul | ((uint32_t)ur << 16) };
+    return f;
+}
+
+static inline lucier_frame_t lucier_frame_unpack(lucier_pframe_t f) {
+    const int16_t ql = (int16_t)(uint16_t)(f.lr & 0xFFFFu);
+    const int16_t qr = (int16_t)(uint16_t)(f.lr >> 16);
+    lucier_frame_t out = { (float)ql * LUCIER_Q_INV, (float)qr * LUCIER_Q_INV };
+    return out;
+}
+
+/*
  * External room reflection & Schroeder allpass delay memory (~28 KB).
  * Allocate via os_malloc(sizeof(lucier_space_t)) in init() so the TAPP model stays small.
  */
@@ -127,6 +164,7 @@ typedef struct {
     float agc_gain;
     float agc_a;
     float gain_slew;
+    uint32_t rng_state;
 } lucier_engine_t;
 
 /* Initialize engine with sample rate (48000.0f) and default Middletown 1969 room parameters */
@@ -167,8 +205,8 @@ float lucier_clip_guard(float x);
 lucier_frame_t lucier_process_frame(lucier_engine_t* d, lucier_frame_t in, float write_enable);
 
 /*
- * Step-safe in-place loop re-recorder: writes `next_gen` back into `buf` only on frames
- * the playhead has just stepped past (matching varispeed/reverse safe interpolation).
+ * Step-safe in-place loop re-recorder: writes `next_gen` back into 32-bit packed `buf`
+ * using unbiased stochastic rounding only on frames the playhead has just stepped past.
  */
-void lucier_commit_step(const lucier_engine_t* d, lucier_frame_t* buf, uint32_t rec_size,
+void lucier_commit_step(lucier_engine_t* d, lucier_pframe_t* buf, uint32_t rec_size,
                         int32_t prev_i, int32_t step, lucier_frame_t next_gen, float gate);
