@@ -1706,24 +1706,23 @@ static bool pm_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate PSRAM for 4 custom 24 kHz recording/take slots (4s -> 3s -> 2s -> 1s each).
+     * 3. Allocate PSRAM for 4 custom 24 kHz recording/take slots
+     *    (4s -> 3s -> 2s -> 1s -> 0.5s each), keeping >= 128 KB free for UI menus.
      */
-    static const uint32_t kCandSecs[] = { 4u, 3u, 2u, 1u };
-    const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
+    static const uint32_t kCandFrames[] = {
+        4u * PM_INTERNAL_SR,
+        3u * PM_INTERNAL_SR,
+        2u * PM_INTERNAL_SR,
+        1u * PM_INTERNAL_SR,
+        PM_INTERNAL_SR / 2u
+    };
+    const uint32_t n_cands = (uint32_t)(sizeof(kCandFrames) / sizeof(kCandFrames[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
-        const uint32_t per_slot = kCandSecs[c] * PM_INTERNAL_SR;
+        const uint32_t per_slot = kCandFrames[c];
         const size_t bytes = (size_t)per_slot * PM_NUM_MICS * sizeof(pm_frame_t);
         pm_frame_t* mem = (pm_frame_t*)os_malloc(bytes);
         if (!mem) continue;
-        if (c + 1u >= n_cands) {
-            m->slots_mem = mem;
-            m->max_slot_frames = per_slot;
-            for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
-                m->slot_buf[s] = mem + s * per_slot;
-            }
-            break;
-        }
-        void* heap_guard = os_malloc(64u * 1024u);
+        void* heap_guard = os_malloc((c + 1u < n_cands) ? (128u * 1024u) : (64u * 1024u));
         if (heap_guard) {
             os_free(heap_guard);
             m->slots_mem = mem;

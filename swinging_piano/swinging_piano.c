@@ -1822,10 +1822,10 @@ static bool swing_app_init(os_app_t* app) {
     }
 
     /*
-     * 3. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 2s),
-     *    keeping 64 KB free heap on >2s candidates and accepting 2s unconditionally.
+     * 3. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 3s -> 2s -> 1s),
+     *    keeping >= 128 KB free heap on >= 2s so `ui_menu_show()` always opens on the emulator.
      */
-    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 2u };
+    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 3u, 2u, 1u };
     const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
     for (uint32_t c = 0u; c < n_cands; ++c) {
         const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
@@ -1836,7 +1836,7 @@ static bool swing_app_init(os_app_t* app) {
             m->max_frames = frames;
             break;
         }
-        void* heap_guard = os_malloc(64u * 1024u);
+        void* heap_guard = os_malloc(128u * 1024u);
         if (heap_guard) {
             os_free(heap_guard);
             m->loop_buf = lb;

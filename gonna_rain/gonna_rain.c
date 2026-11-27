@@ -156,6 +156,7 @@ typedef struct {
 
     /* Menu & cached UI strings */
     ui_menu_t*        menu;
+    uint32_t          last_draw_ms;
     uint8_t           in_src;
     uint8_t           hint_state;
     bool              hint_drift;
@@ -1581,7 +1582,13 @@ static bool rain_tick(os_app_t* app) {
         rain_hints(m);
     }
 
-    return true;
+    const uint32_t now_ms = os_tick_get();
+    const uint32_t frame_ms = m->vol_ui ? 80u : 33u;
+    if (m->last_draw_ms == 0u || (now_ms - m->last_draw_ms >= frame_ms)) {
+        m->last_draw_ms = (now_ms != 0u) ? now_ms : 1u;
+        return true;
+    }
+    return false;
 }
 
 /* ----------------------------------------------------------------------------
@@ -1699,30 +1706,9 @@ static bool rain_app_init(os_app_t* app) {
     rain_model_t* m = (rain_model_t*)os_app_get_model(app);
 
     /*
-     * Non-destructive dual/quad head loop buffer in PSRAM with graceful fallback:
-     * 24s -> 16s -> 12s -> 8s -> 6s -> 4s -> 2s.
+     * 1. Initialize Reich DSP & all `params_t` fields FIRST so `ui_menu_create()`
+     *    sees valid parameter descriptors when `menu_root_builder` runs.
      */
-    static const uint32_t kCandSecs[] = { 24u, 16u, 12u, 8u, 6u, 4u, 2u };
-    for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        reich_frame_t* lb = (reich_frame_t*)os_malloc((size_t)frames * sizeof(reich_frame_t));
-        if (lb) {
-            m->loop_buf = lb;
-            m->max_frames = frames;
-            break;
-        }
-    }
-    if (!m->loop_buf) return false;
-
-    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
-
-    tape_t* t = tape_get();
-    if (t) {
-        m->wb = tape_buffer_init(t);
-    }
-    m->bounce_cur_win = WIN_NONE;
-
-    /* Initialize Reich Tape-Phasing DSP engine */
     reich_init(&m->dsp, (float)TAPP_SAMPLE_RATE);
 
     m->drifting = true;
@@ -1752,6 +1738,57 @@ static bool rain_app_init(os_app_t* app) {
     m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
 
+    /*
+     * 2. Allocate staging buffer, DMA window pair, and modal menu BEFORE the
+     *    large audio loop buffer so menu creation NEVER runs out of heap.
+     */
+    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
+
+    tape_t* t = tape_get();
+    if (t) {
+        m->wb = tape_buffer_init(t);
+    }
+    m->bounce_cur_win = WIN_NONE;
+
+    m->menu = ui_menu_create(m, menu_root_builder);
+    if (m->menu) {
+        ui_menu_set_name(m->menu, "GONNA RAIN");
+        ui_menu_set_header(m->menu, true);
+    }
+
+    /*
+     * 3. Non-destructive dual/quad head loop buffer in PSRAM with >= 256 KB UI
+     *    heap reserve (128 KB on 2s, unconditional on 1s) so `ui_menu_show()` opens:
+     *    24s -> 16s -> 12s -> 8s -> 6s -> 4s -> 3s -> 2s -> 1s.
+     */
+    static const uint32_t kCandSecs[] = { 24u, 16u, 12u, 8u, 6u, 4u, 3u, 2u, 1u };
+    const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
+    for (uint32_t c = 0u; c < n_cands; ++c) {
+        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
+        reich_frame_t* lb = (reich_frame_t*)os_malloc((size_t)frames * sizeof(reich_frame_t));
+        if (!lb) continue;
+        if (c + 1u >= n_cands) {
+            m->loop_buf = lb;
+            m->max_frames = frames;
+            break;
+        }
+        const size_t guard_sz = (kCandSecs[c] > 2u) ? (256u * 1024u) : (128u * 1024u);
+        void* guard = os_malloc(guard_sz);
+        if (guard) {
+            os_free(guard);
+            m->loop_buf = lb;
+            m->max_frames = frames;
+            break;
+        }
+        os_free(lb);
+    }
+    if (!m->loop_buf) {
+        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
+        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
+        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
+        return false;
+    }
+
     if (t) {
         tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
         tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
@@ -1760,12 +1797,6 @@ static bool rain_app_init(os_app_t* app) {
         tape_timeline_set_loop(false);
         tape_timeline_show(true);
         tape_timeline_zoom_out();
-    }
-
-    m->menu = ui_menu_create(m, menu_root_builder);
-    if (m->menu) {
-        ui_menu_set_name(m->menu, "GONNA RAIN");
-        ui_menu_set_header(m->menu, true);
     }
 
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */

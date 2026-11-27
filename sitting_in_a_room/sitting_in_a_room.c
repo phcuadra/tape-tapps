@@ -162,6 +162,7 @@ typedef struct {
 
     /* Menu & cached UI state */
     ui_menu_t*        menu;
+    uint32_t          last_draw_ms;
     uint8_t           in_src;
     uint8_t           hint_state;
     bool              hint_rerec;
@@ -1530,7 +1531,13 @@ static bool sit_tick(os_app_t* app) {
         sit_hints(m);
     }
 
-    return true;
+    const uint32_t now_ms = os_tick_get();
+    const uint32_t frame_ms = m->vol_ui ? 80u : 33u;
+    if (m->last_draw_ms == 0u || (now_ms - m->last_draw_ms >= frame_ms)) {
+        m->last_draw_ms = (now_ms != 0u) ? now_ms : 1u;
+        return true;
+    }
+    return false;
 }
 
 /* ----------------------------------------------------------------------------
@@ -1646,40 +1653,11 @@ static void sit_input(os_app_t* app, uint8_t btn, KeyStateEnum st) {
 static bool sit_app_init(os_app_t* app) {
     sit_model_t* m = (sit_model_t*)os_app_get_model(app);
 
-    /* Allocate stereo float RAM loop buffer + Q15 Gen-1 backup with graceful fallback */
-    static const uint32_t kCandSecs[] = { 16u, 12u, 8u, 6u, 4u, 2u };
-    for (uint32_t c = 0; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        lucier_frame_t* lb = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
-        if (!lb) continue;
-        int16_t* bb = (int16_t*)os_malloc((size_t)frames * 2u * sizeof(int16_t));
-        if (bb) {
-            m->loop_buf = lb;
-            m->backup_buf = bb;
-            m->max_frames = frames;
-            break;
-        }
-        os_free(lb);
-    }
-    if (!m->loop_buf) {
-        const uint32_t frames = 2u * TAPP_SAMPLE_RATE;
-        m->loop_buf = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
-        if (!m->loop_buf) return false;
-        m->max_frames = frames;
-    }
-
-    m->room_space = (lucier_space_t*)os_malloc(sizeof(lucier_space_t));
-    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
-
-    tape_t* t = tape_get();
-    if (t) {
-        m->wb = tape_buffer_init(t);
-    }
-    m->bounce_cur_win = WIN_NONE;
-
-    /* Initialize Lucier Room-Resonance DSP engine & attach reflection workspace */
+    /*
+     * 1. Initialize Lucier DSP & all `params_t` fields FIRST so `ui_menu_create()`
+     *    sees valid parameter descriptors when `menu_root_builder` runs.
+     */
     lucier_init(&m->dsp, (float)TAPP_SAMPLE_RATE);
-    lucier_attach_space(&m->dsp, m->room_space);
 
     /* Default to re-recording ON so captured loops begin evolving after Gen 1 statement */
     m->rerec_on = true;
@@ -1709,6 +1687,75 @@ static bool sit_app_init(os_app_t* app) {
     m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
 
+    /*
+     * 2. Allocate room workspace, staging buffer, DMA window pair, and modal menu
+     *    BEFORE the large audio loop buffers so menu creation NEVER starves.
+     */
+    m->room_space = (lucier_space_t*)os_malloc(sizeof(lucier_space_t));
+    lucier_attach_space(&m->dsp, m->room_space);
+    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
+
+    tape_t* t = tape_get();
+    if (t) {
+        m->wb = tape_buffer_init(t);
+    }
+    m->bounce_cur_win = WIN_NONE;
+
+    m->menu = ui_menu_create(m, menu_root_builder);
+    if (m->menu) {
+        ui_menu_set_name(m->menu, "SITTING ROOM");
+        ui_menu_set_header(m->menu, true);
+    }
+
+    /*
+     * 3. Allocate stereo float RAM loop + Q15 Gen-1 backup with >= 256 KB UI
+     *    heap reserve (128 KB on 1s fallback) so `ui_menu_show()` always opens.
+     */
+    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 3u, 2u, 1u };
+    const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
+    for (uint32_t c = 0u; c < n_cands; ++c) {
+        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
+        const size_t guard_sz = (kCandSecs[c] > 1u) ? (256u * 1024u) : (128u * 1024u);
+        lucier_frame_t* lb = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
+        if (!lb) continue;
+        int16_t* bb = (int16_t*)os_malloc((size_t)frames * 2u * sizeof(int16_t));
+        if (bb) {
+            void* guard = os_malloc(guard_sz);
+            if (guard) {
+                os_free(guard);
+                m->loop_buf = lb;
+                m->backup_buf = bb;
+                m->max_frames = frames;
+                break;
+            }
+            os_free(bb);
+        }
+        os_free(lb);
+    }
+    if (!m->loop_buf) {
+        /* Last-resort: loop buffer without Gen-1 backup snapshot (2s -> 1s) */
+        for (uint32_t secs = 2u; secs >= 1u; --secs) {
+            const uint32_t frames = secs * TAPP_SAMPLE_RATE;
+            lucier_frame_t* lb = (lucier_frame_t*)os_malloc((size_t)frames * sizeof(lucier_frame_t));
+            if (!lb) continue;
+            void* guard = (secs > 1u) ? os_malloc(128u * 1024u) : os_malloc(64u * 1024u);
+            if (guard || secs == 1u) {
+                if (guard) os_free(guard);
+                m->loop_buf = lb;
+                m->max_frames = frames;
+                break;
+            }
+            os_free(lb);
+        }
+        if (!m->loop_buf) {
+            if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
+            if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
+            if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
+            if (m->room_space) { os_free(m->room_space);   m->room_space = NULL; }
+            return false;
+        }
+    }
+
     if (t) {
         tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
         tape_timeline_attach_params(0u, &m->tl_pos, &m->tl_start, &m->tl_end);
@@ -1717,12 +1764,6 @@ static bool sit_app_init(os_app_t* app) {
         tape_timeline_set_loop(false);
         tape_timeline_show(true);
         tape_timeline_zoom_out();
-    }
-
-    m->menu = ui_menu_create(m, menu_root_builder);
-    if (m->menu) {
-        ui_menu_set_name(m->menu, "SITTING ROOM");
-        ui_menu_set_header(m->menu, true);
     }
 
     /* Save user's monitor/WET state, silence idle speaker bleed, and tame hot mic gain */
