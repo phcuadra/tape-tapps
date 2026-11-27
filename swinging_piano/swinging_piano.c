@@ -1589,9 +1589,11 @@ static bool swing_tick(os_app_t* app) {
     /* Update pendulum motion trail every ~80 ms */
     if ((m->state == ST_PLAY || idle_moving) && (now_ms - m->last_trail_ms >= 80u)) {
         m->last_trail_ms = now_ms;
-        for (uint32_t k = 0u; k + 1u < TRAIL_LEN; ++k) {
-            m->trail_deg[k] = m->trail_deg[k + 1u];
-        }
+        m->trail_deg[0] = m->trail_deg[1];
+        m->trail_deg[1] = m->trail_deg[2];
+        m->trail_deg[2] = m->trail_deg[3];
+        m->trail_deg[3] = m->trail_deg[4];
+        m->trail_deg[4] = m->trail_deg[5];
         const float cd = clampf(m->dsp.live_deg_x, -62.0f, 62.0f);
         m->trail_deg[TRAIL_LEN - 1u] = (int8_t)(cd >= 0.0f ? (cd + 0.5f) : (cd - 0.5f));
     }
@@ -1628,9 +1630,11 @@ static bool swing_tick(os_app_t* app) {
     const bool toast_win = (m->anim_until_ms != 0u) && ((int32_t)(m->anim_until_ms - now_ms) > 0);
     const bool animating = (m->state == ST_PLAY || m->state == ST_REC ||
                             m->bouncing || idle_moving || toast_win);
-    if (m->ui_dirty || (animating && (now_ms - m->last_draw_ms >= UI_FRAME_MS))) {
+    const uint32_t frame_ms = m->vol_ui ? 80u : UI_FRAME_MS;
+    if ((m->ui_dirty || animating) &&
+        (m->last_draw_ms == 0u || (now_ms - m->last_draw_ms >= frame_ms))) {
         m->ui_dirty = false;
-        m->last_draw_ms = now_ms;
+        m->last_draw_ms = (now_ms != 0u) ? now_ms : 1u;
         return true;
     }
 
@@ -1760,53 +1764,10 @@ static bool swing_app_init(os_app_t* app) {
     swing_model_t* m = (swing_model_t*)os_app_get_model(app);
 
     /*
-     * 1. Allocate 62 KB interleaved delay/FDN workspace, staging buffer, DMA
-     *    window pair, and menu FIRST so OS/UI heap allocations never starve.
+     * 1. Initialize DSP & all `params_t` fields FIRST — `ui_menu_create()`
+     *    executes `menu_root_builder` immediately and inspects `&m->mic_trim`.
      */
-    m->space = (swing_space_t*)os_malloc(sizeof(swing_space_t));
-    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
-
-    tape_t* t = tape_get();
-    if (t) {
-        m->wb = tape_buffer_init(t);
-    }
-    m->bounce_cur_win = WIN_NONE;
-
-    m->menu = ui_menu_create(m, menu_root_builder);
-    if (m->menu) {
-        ui_menu_set_name(m->menu, "SWINGING PIANO");
-        ui_menu_set_header(m->menu, true);
-    }
-
-    /*
-     * 2. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 2s)
-     *    while keeping >= 512 KB of free OS heap for menus, notifications & toasts.
-     */
-    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 2u };
-    for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
-        swing_frame_t* lb = (swing_frame_t*)os_malloc((size_t)frames * sizeof(swing_frame_t));
-        if (!lb) continue;
-        void* heap_guard = os_malloc(512u * 1024u);
-        if (heap_guard) {
-            os_free(heap_guard);
-            m->loop_buf = lb;
-            m->max_frames = frames;
-            break;
-        }
-        os_free(lb);
-    }
-    if (!m->loop_buf) {
-        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
-        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
-        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
-        if (m->space)      { os_free(m->space);        m->space = NULL; }
-        return false;
-    }
-
-    /* Initialize Barbican Pendulum + Hall Acoustic DSP engine */
     pendulum_init(&m->dsp, (float)TAPP_SAMPLE_RATE);
-    pendulum_attach_space(&m->dsp, m->space);
 
     m->swing_on = true;
     m->speed_cur = 1.0f;
@@ -1839,6 +1800,58 @@ static bool swing_app_init(os_app_t* app) {
     m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
+
+    /*
+     * 2. Allocate 62 KB delay/FDN workspace, staging buffer, DMA window pair,
+     *    and menu BEFORE the large PSRAM loop buffer so they never starve.
+     */
+    m->space = (swing_space_t*)os_malloc(sizeof(swing_space_t));
+    pendulum_attach_space(&m->dsp, m->space);
+    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR * 2u * sizeof(float));
+
+    tape_t* t = tape_get();
+    if (t) {
+        m->wb = tape_buffer_init(t);
+    }
+    m->bounce_cur_win = WIN_NONE;
+
+    m->menu = ui_menu_create(m, menu_root_builder);
+    if (m->menu) {
+        ui_menu_set_name(m->menu, "SWINGING PIANO");
+        ui_menu_set_header(m->menu, true);
+    }
+
+    /*
+     * 3. Allocate PSRAM stereo loop buffer (16s -> 12s -> 10s -> 8s -> 6s -> 4s -> 2s),
+     *    keeping 64 KB free heap on >2s candidates and accepting 2s unconditionally.
+     */
+    static const uint32_t kCandSecs[] = { 16u, 12u, 10u, 8u, 6u, 4u, 2u };
+    const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
+    for (uint32_t c = 0u; c < n_cands; ++c) {
+        const uint32_t frames = kCandSecs[c] * TAPP_SAMPLE_RATE;
+        swing_frame_t* lb = (swing_frame_t*)os_malloc((size_t)frames * sizeof(swing_frame_t));
+        if (!lb) continue;
+        if (c + 1u >= n_cands) {
+            m->loop_buf = lb;
+            m->max_frames = frames;
+            break;
+        }
+        void* heap_guard = os_malloc(64u * 1024u);
+        if (heap_guard) {
+            os_free(heap_guard);
+            m->loop_buf = lb;
+            m->max_frames = frames;
+            break;
+        }
+        os_free(lb);
+    }
+    if (!m->loop_buf) {
+        if (m->menu)       { ui_menu_destroy(m->menu); m->menu = NULL; }
+        if (m->wb)         { tape_buffer_deinit(m->wb); m->wb = NULL; }
+        if (m->read_stage) { os_free(m->read_stage);   m->read_stage = NULL; }
+        if (m->space)      { os_free(m->space);        m->space = NULL; }
+        return false;
+    }
 
     if (t) {
         tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);

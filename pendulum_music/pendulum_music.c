@@ -1641,47 +1641,9 @@ static bool pm_app_init(os_app_t* app) {
     pm_model_t* m = (pm_model_t*)os_app_get_model(app);
 
     /*
-     * 1. `m->space` (7.5 KB) is already embedded inside `pm_model_t` in fast
-     *    internal SRAM! Allocate SD staging, DMA window pair, and menu first.
+     * 1. Initialize 24 kHz DSP & all `params_t` fields FIRST — `ui_menu_create()`
+     *    executes `menu_root_builder` immediately and inspects `&m->mic_trim`.
      */
-    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR48 * 2u * sizeof(float));
-
-    tape_t* t = tape_get();
-    if (t) {
-        m->wb = tape_buffer_init(t);
-    }
-    m->bounce_cur_win = WIN_NONE;
-
-    m->menu = ui_menu_create(m, menu_root_builder);
-    if (m->menu) {
-        ui_menu_set_name(m->menu, "PENDULUM MUSIC");
-        ui_menu_set_header(m->menu, true);
-    }
-
-    /*
-     * 2. Allocate PSRAM for 4 custom 24 kHz recording/take slots (4s -> 3s -> 2s each),
-     *    enforcing >= 512 KB of free OS heap afterward so menus/icons/toasts never starve.
-     */
-    static const uint32_t kCandSecs[] = { 4u, 3u, 2u, 1u };
-    for (uint32_t c = 0u; c < (sizeof(kCandSecs) / sizeof(kCandSecs[0])); ++c) {
-        const uint32_t per_slot = kCandSecs[c] * PM_INTERNAL_SR;
-        const size_t bytes = (size_t)per_slot * PM_NUM_MICS * sizeof(pm_frame_t);
-        pm_frame_t* mem = (pm_frame_t*)os_malloc(bytes);
-        if (!mem) continue;
-        void* heap_guard = os_malloc(512u * 1024u);
-        if (heap_guard) {
-            os_free(heap_guard);
-            m->slots_mem = mem;
-            m->max_slot_frames = per_slot;
-            for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
-                m->slot_buf[s] = mem + s * per_slot;
-            }
-            break;
-        }
-        os_free(mem);
-    }
-
-    /* 3. Initialize 24 kHz Reich 4-pendulum coupled acoustic feedback DSP */
     pm_dsp_init(&m->dsp, (float)PM_INTERNAL_SR);
     pm_dsp_attach_space(&m->dsp, &m->space);
 
@@ -1691,7 +1653,6 @@ static bool pm_app_init(os_app_t* app) {
     m->bank_idx = PM_BANK_ORGANS;
     pm_do_seed_bank(m, false);
 
-    /* Invalidate cached UI strings so first redraw populates them */
     m->cached_phi_pc = -32767;
     for (uint8_t idx = 0u; idx < ENC_TOTAL; ++idx) {
         m->cached_prm_pc[idx] = -32767;
@@ -1726,6 +1687,54 @@ static bool pm_app_init(os_app_t* app) {
     m->tl_pos   = (params_t)PARAM_RANGE("pos",   0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_start = (params_t)PARAM_RANGE("start", 0.0f, 0.0f, 1.0e9f, 1.0f);
     m->tl_end   = (params_t)PARAM_RANGE("end",   0.0f, 0.0f, 1.0e9f, 1.0f);
+
+    /*
+     * 2. Allocate SD staging, DMA window pair, and menu BEFORE large slot buffers.
+     */
+    m->read_stage = (float*)os_malloc((size_t)LOAD_CHUNK_FR48 * 2u * sizeof(float));
+
+    tape_t* t = tape_get();
+    if (t) {
+        m->wb = tape_buffer_init(t);
+    }
+    m->bounce_cur_win = WIN_NONE;
+
+    m->menu = ui_menu_create(m, menu_root_builder);
+    if (m->menu) {
+        ui_menu_set_name(m->menu, "PENDULUM MUSIC");
+        ui_menu_set_header(m->menu, true);
+    }
+
+    /*
+     * 3. Allocate PSRAM for 4 custom 24 kHz recording/take slots (4s -> 3s -> 2s -> 1s each).
+     */
+    static const uint32_t kCandSecs[] = { 4u, 3u, 2u, 1u };
+    const uint32_t n_cands = (uint32_t)(sizeof(kCandSecs) / sizeof(kCandSecs[0]));
+    for (uint32_t c = 0u; c < n_cands; ++c) {
+        const uint32_t per_slot = kCandSecs[c] * PM_INTERNAL_SR;
+        const size_t bytes = (size_t)per_slot * PM_NUM_MICS * sizeof(pm_frame_t);
+        pm_frame_t* mem = (pm_frame_t*)os_malloc(bytes);
+        if (!mem) continue;
+        if (c + 1u >= n_cands) {
+            m->slots_mem = mem;
+            m->max_slot_frames = per_slot;
+            for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
+                m->slot_buf[s] = mem + s * per_slot;
+            }
+            break;
+        }
+        void* heap_guard = os_malloc(64u * 1024u);
+        if (heap_guard) {
+            os_free(heap_guard);
+            m->slots_mem = mem;
+            m->max_slot_frames = per_slot;
+            for (uint32_t s = 0u; s < PM_NUM_MICS; ++s) {
+                m->slot_buf[s] = mem + s * per_slot;
+            }
+            break;
+        }
+        os_free(mem);
+    }
 
     if (t) {
         tape_timeline_setup(1u, 8, 208, SCREEN_WIDTH - 16, 28);
