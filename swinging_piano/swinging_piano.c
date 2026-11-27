@@ -1057,8 +1057,8 @@ static void swing_vol_hide(swing_model_t* m) {
 #define STAGE_H       110
 #define TRACK_X       154
 #define TRACK_W       232       /* 116 bins * 2px */
-#define TRACK_MID_Y   118
-#define TRACK_HALF_H  36
+#define TRACK_MID_Y   120
+#define TRACK_HALF_H  38
 #define FOOTER_Y      166
 
 #define CARD_Y        190
@@ -1357,22 +1357,18 @@ static void draw_waveform_stage(gfx_t* gfx, const swing_model_t* m) {
         return;
     }
 
-    /* Empty state prompt */
+    /* Empty state */
     if (m->loop_len < 8u) {
         gfx_draw_hline_dithered(gfx, TRACK_X, TRACK_MID_Y, TRACK_W, 1);
 
         /* Decaying pendulum harmonic trace */
         for (int i = 0; i < TRACK_W; i += 2) {
             const uint16_t ph = (uint16_t)((i * 65536) / 56);
-            const int env = 14 - (i * 11) / TRACK_W;
+            const int env = 20 - (i * 15) / TRACK_W;
             const int y = ((int)lutsin_q15(ph) * env) >> 15;
-            gfx_draw_pixel(gfx, TRACK_X + i, TRACK_MID_Y - 5 - y);
+            gfx_draw_pixel(gfx, TRACK_X + i, TRACK_MID_Y - y);
         }
 
-        gfx_set_font(gfx, DepartureMono_Regular_10);
-        const char* hint = "REC OR MENU -> SEED PIANO";
-        const int hw = (int)gfx_get_str_width(gfx, hint);
-        gfx_draw_str(gfx, STAGE_X + (STAGE_W - hw) / 2, FOOTER_Y - 6, hint);
         draw_footer_strip(gfx, m);
         return;
     }
